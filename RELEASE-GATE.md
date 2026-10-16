@@ -1,0 +1,33 @@
+# Release gate: four tamper tests
+
+Attacker model: code running as the same user as the agent. In the tests the store is a temp
+directory made read-only to stand in for a root-owned directory. All four pass in the automated
+suite. Two of them only mean something on a real machine after the human completes the one-time root
+install and signs with their passphrase-protected key; the table says which.
+
+Run everything (from the repository root):
+`python3 -m unittest discover -s tests -v`
+
+| # | Test | Automated result | Exact command | Needs the human's root install + passphrase for real? |
+|---|------|------------------|---------------|-----------------------------------|
+| 1 | Baseline replacement: attacker writes a new manifest or overwrites the store copy; `check` must fail | PASS | `cd tests && python3 -m unittest test_tamper.TamperTests.test_1_baseline_replacement` | Yes. Without root ownership of the store, a same-user attacker can also overwrite `allowed_signers` with their own key. |
+| 2 | Verifier replacement: attacker swaps the user-side script for an always-clean one; the store's copy still reports drift | PASS | `cd tests && python3 -m unittest test_tamper.TamperTests.test_2_verifier_replacement` | Yes. Passes for real only when the daemon runs the root-owned copy. Without the root install the tool is detection-only. |
+| 3 | Rollback: attacker restores an older, validly signed manifest; `check` and `promote` must refuse | PASS | `cd tests && python3 -m unittest test_tamper.TamperTests.test_3_rollback` | Yes for the same reason (the last-seen sequence must be in a store the attacker cannot write). |
+| 4 | Disabled collection: user hook deleted and runs stopped; heartbeat goes stale; result is STALE, not clean | PASS | `cd tests && python3 -m unittest test_tamper.TamperTests.test_4_disabled_collection` | Yes. The heartbeat is trustworthy only if root writes it. |
+
+Extra cases: `test_1b_missing_signature_fails_closed`, `test_3b_same_seq_replacement`.
+
+## What the human must do once (the agent never does these)
+1. Generate a passphrase-protected signing key: `ssh-keygen -t ed25519 -f ~/.ssh/agent_integrity_signing`
+2. `sudo ./install-root.sh --pubkey ~/.ssh/agent_integrity_signing.pub --user-home "$HOME"`
+3. `python3 agent_integrity.py baseline`, review, then `python3 agent_integrity.py sign --key ~/.ssh/agent_integrity_signing`
+   and run the one `sudo ... promote` command it prints.
+4. Confirm on the real machine: `sudo launchctl print system/dev.agent-integrity.check` (macOS) shows
+   the job, and `python3 agent_integrity.py status` prints a clean result with a fresh timestamp.
+
+## What the automated pass does not prove
+- It simulates root ownership with `chmod`; a same-user process could chmod it back. Real ownership is
+  the control, so a pass here is evidence the logic is right, not that a given machine is protected.
+- It does not run launchd or systemd, and `install-root.sh` is tested in a non-root test mode against
+  temp directories.
+- Nothing here is a claim the tool detects every poisoned file (see the README).
