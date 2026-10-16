@@ -1882,10 +1882,14 @@ def render_html(res: Result, hist: list[dict], accepted: dict, now: float) -> st
                 p.append(f'<div class="ai"><b>Escalated</b>: {e(it["escalated"]["why"])}</div>')
             if item_rank(it) >= 2:
                 cmd_sign = f"python3 {self_q} baseline && python3 {self_q} sign --key <your-key>"
-                cmd_quar = f"python3 {self_q} quarantine {shlex.quote(it['key'])}"
                 p.append("<p>After you have read it, bless it:</p>"
-                         f"<pre>{e(cmd_sign)}</pre>"
-                         f"<p>Or move it aside (restorable):</p><pre>{e(cmd_quar)}</pre>")
+                         f"<pre>{e(cmd_sign)}</pre>")
+                if "#" in it["key"]:
+                    # An entry inside a shared file: moving the file would break the agent itself.
+                    p.append(f"<p>Or delete that entry from <code>{e(it['key'].split('#')[0])}</code> by hand.</p>")
+                else:
+                    cmd_quar = f"python3 {self_q} quarantine {shlex.quote(it['key'])}"
+                    p.append(f"<p>Or move it aside (restorable):</p><pre>{e(cmd_quar)}</pre>")
             p.append("</div>")
         if len(detailed) > 25:
             p.append(f"<p>... and {len(detailed) - 25} more detailed item(s); see --format json.</p>")
@@ -2046,6 +2050,9 @@ def cmd_quarantine(args) -> int:
         manifest = {}
     ctx = make_ctx(args, store, manifest)
     key = args.key
+    if "#" in key:
+        print(f"refused: {key} is an entry inside a shared file; delete the entry by hand", file=sys.stderr)
+        return EXIT_USAGE
     if not key_is_watched(ctx, key):
         print(f"refused: {key} is not inside a watched agent-file surface", file=sys.stderr)
         return EXIT_USAGE

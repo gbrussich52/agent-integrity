@@ -246,7 +246,7 @@ class DashboardTests(AutoEnv):
             self.assertNotIn(bad, h, bad)
         self.assertIn("MCP server &#x27;b&#x27; added", h)
         self.assertIn("prefers-color-scheme", h)
-        self.assertIn("quarantine", h)
+        self.assertIn("delete that entry from <code>~/.claude.json</code> by hand", h)  # no file-move for a shared-file entry
 
     def test_hostile_filename_is_escaped(self):
         self.write(".claude/skills/<script>alert(1)</script>/SKILL.md", "# x\nhi\n")
@@ -297,6 +297,13 @@ class QuarantineTests(AutoEnv):
             r = self.q(key)
             self.assertNotEqual(r.returncode, 0, key)
         self.assertTrue(victim.exists())
+
+    def test_refuses_entry_inside_shared_file(self):
+        shared = self.write(".claude.json", '{"mcpServers": {"b": {"command": "/x/srv"}}}\n')
+        r = self.q("~/.claude.json#mcpServers")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("by hand", r.stderr)
+        self.assertTrue(shared.exists())
 
 
 class InstallUserTests(AutoEnv):
