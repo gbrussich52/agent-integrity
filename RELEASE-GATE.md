@@ -23,6 +23,16 @@ never stored), `tests/test_autopilot.py` (settle timing and reset, escalate-only
 loopback backend including prompt injection and backend down, remote refusal, alert dedup, dashboard
 escaping and no external assets, quarantine refusal, install-user, the 5,000-file break test).
 
+## Audit trail and slow-drift tests (0.3.0)
+`tests/test_trail.py` (chain verify, tamper on a middle line, removed and reordered lines, tail
+truncation via the heartbeat head, prune and retention keep the chain valid, protected-mode fail-closed
+for `check`, `verify-log`, `history`, `--as-of`, `diff --since`, the sign event) and
+`tests/test_slowdrift.py` (all four rules over multi-month fake clocks, alert dedupe, a `watch`
+end-to-end). The 5,000-file break test stays at 20 lines or fewer.
+
+Not a CI gate: `bench/run.py --model gpt-oss:20b` needs a local model. Before a release, run it and
+record the pass rate in `bench/HISTORY.md`; it must be at least 90%.
+
 ## What the human must do once (the agent never does these)
 With autopilot the human steps shrink to the one-time key, `install-root.sh` and `install-user.sh`;
 after that only risk-raising changes ask for a signature.
@@ -36,6 +46,8 @@ after that only risk-raising changes ask for a signature.
 ## What the automated pass does not prove
 - It simulates root ownership with `chmod`; a same-user process could chmod it back. Real ownership is
   the control, so a pass here is evidence the logic is right, not that a given machine is protected.
+- The audit trail is unsigned: with real root ownership it resists an agent running as the user, but a
+  root-level attacker can rewrite it. The tests only simulate protected mode.
 - It does not run launchd or systemd, and `install-root.sh` is tested in a non-root test mode against
   temp directories.
 - Nothing here is a claim the tool detects every poisoned file (see the README).

@@ -70,6 +70,77 @@ pasted into them, to that remote host. Leave it off unless you accept that.
 | Auto-accept (settle) | written by the root daemon | written by `watch`, so only as trustworthy as your account |
 | `escalations.json` (user side) | read as hold-only input: forging it can delay a settle, never cause one | same |
 
+## Audit trail and look-back (0.3.0)
+
+Settling and autopilot keep the daily noise down; the trail makes sure nothing they accept is ever
+forgotten.
+
+- **`events.jsonl`** sits next to the overlay. One line for every change the tool observed (once per
+  new contents), plus one for each `sign` and each auto-accept. Each line carries the plain-English
+  change, its risk, who accepted it (`E8` official-marketplace update, `R-settle`, `sign`, or nobody
+  yet), and `prev_hash` / `hash`, so the file is an append-only chain: `hash = sha256(prev_hash +
+  canonical JSON of the line)`. Writer: the root job in protected mode; the user folder in
+  unprotected mode, and every output says which.
+- **The AI never writes the chain in protected mode.** Root does not call a model. The user job adds
+  its summary as a separate `explained` line in `explained.jsonl`, pointing at the change's hash.
+- **`verify-log`** walks the chain and names the first broken line. In protected mode `check` and
+  `watch` fail closed (exit 3) when the chain is broken. The root heartbeat records the chain head, so
+  deleting lines from the end is caught too.
+- **Daily snapshot** (`snapshots/YYYY-MM-DD.json.gz`: digests, plus normalized fingerprints for config
+  files) and a **weekly dashboard copy** (`reports/YYYY-Www.html`).
+- **Retention.** `retention_days` (config, default 365). Only whole days older than that are pruned,
+  with their snapshots and old reports. Pruning appends a `prune` event holding the hash of the last
+  removed line, so the chain still verifies. The newest signed baseline copy is always kept.
+
+Look back:
+
+```sh
+python3 agent_integrity.py history ~/.claude/settings.json --since 180d   # one file, newest first
+python3 agent_integrity.py diff --since signed                            # now vs your last signature
+python3 agent_integrity.py diff --since 90d                               # now vs the snapshot 90 days ago
+python3 agent_integrity.py report --html out.html --as-of 2026-08-01      # the dashboard as it was that day
+python3 agent_integrity.py verify-log
+```
+
+The dashboard has a "Since you last signed" section (everything accepted along the way is listed, never
+hidden) and a "Then vs now" panel with 30, 90, 180 and 365-day tabs. Pure HTML and CSS, no scripts.
+`diff` exits 1 when something differs. Cumulative diffs compare saved fingerprints, so they do not
+rerun the signature scan.
+
+What the trail is not: the chain is hashed, not signed. In protected mode it is only as safe as root
+ownership of the store; in unprotected mode a process running as you can rewrite the whole file and
+recompute every hash. It is a record that makes a quiet edit show up, not proof against that process.
+
+## Slow-drift detection (0.3.0)
+
+A change that would be refused as one step can arrive as five small ones. Every run checks the
+cumulative picture, deterministically, with the same classifier:
+
+1. **Cumulative raising.** Now versus the last signed baseline and versus each window snapshot taken
+   since. If the total change is risk-raising, you get an alert even though each step was neutral or
+   settled. (Items already pending as raising are not reported twice.)
+2. **Creep.** At least `creep_threshold` (default 5) settled changes to one security-relevant file
+   (settings, MCP config, hooks, rules) within 90 days since your last signature: review-soon, with the
+   list.
+3. **Low and slow.** A neutral change followed within 60 days by a risk-raising one in the same file,
+   or by a change that points at something the earlier change introduced (a new script settles, a
+   hook later calls it): raising. The alert links both events.
+4. **Dormant reappearance.** Something removed comes back after 30 or more days with different
+   contents: raising.
+
+Settling never hides any of this: settled changes stay in the trail and in "Since you last signed". A
+later `sign` that covers the exact contents closes a finding. Each rule is tested with a fake clock
+over several months (`tests/test_slowdrift.py`). Rule 1 mostly catches a forged or buggy overlay or a
+classifier miss, since a correct classifier already flags a raising step the moment it happens.
+
+## Explanation clarity benchmark (`bench/`)
+
+`bench/run.py --model gpt-oss:20b` runs the real explainer prompt on 15 realistic changes against a
+local Ollama model and scores each answer without another model: valid JSON, a summary of at most 2
+sentences and 40 words, Flesch reading ease of at least 55 (file names and commands excluded),
+no jargon, every named fact present, an imperative action, and a risk at or above the floor. It is
+not in the CLI path or CI; it needs a local model. `bench/HISTORY.md` records each prompt version.
+
 ## Threat model, honestly
 
 Read this before you rely on it.
@@ -143,6 +214,7 @@ python3 agent_integrity.py check --format sarif   # for code scanning dashboards
 python3 agent_integrity.py scan                   # signatures only, no baseline needed
 python3 agent_integrity.py baseline --i-reviewed <sha256-prefix>   # per-file override of the guard
 python3 agent_integrity.py status                 # what the root job last recorded
+python3 agent_integrity.py history KEY            # see the audit trail section
 ```
 
 After you legitimately change a watched file: `baseline`, review, `sign`. With autopilot you only do

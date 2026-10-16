@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+### What changed
+- Hash-chained, append-only audit trail (`events.jsonl`) with `verify-log`; protected mode fails closed (exit 3) on a broken chain. Daily snapshots, weekly dashboard copies, `retention_days` (default 365) with a `prune` event that keeps the chain valid. The AI summary is a separate `explained` event written by the user job, never by root.
+- `history KEY`, `diff --since 30d|90d|180d|365d|signed`, `report --as-of YYYY-MM-DD`. Dashboard gains "Since you last signed", "Slow-drift warnings" and a "Then vs now" panel (no JavaScript).
+- Slow-drift rules: cumulative raising, creep (`creep_threshold`, default 5 in 90 days), low-and-slow, dormant reappearance. Alerts fire once per finding.
+- Explainer prompt rewritten for plain English (what changed, what an agent can do now, what to do); it also sees the last 3 trail events for the file. `bench/` scores it on 15 scenarios; see `bench/HISTORY.md`.
+- `promote` writes a `sign` event and keeps `signed/<seq>.json.gz` so a past dashboard shows the right baseline.
+
+### Prior behavior
+0.2.x kept only the current overlay and a short history strip. A settled change left no durable record,
+and a series of small accepted changes was never compared against the signed baseline as a whole.
+
+### Why
+Settling is what keeps the daily load small, but it also let several harmless steps add up unseen. The
+trail and the cumulative rules make that visible without asking for more reviews.
+
 ## 0.2.1 (unreleased)
 - Explainer: no per-run count cap by default (`--explain-max 0`). Prior: 10 fresh calls per run. Why: the model is local and free; a 20-minute time budget (was 3) still keeps hourly runs from overlapping, and leftovers are explained next run from the cache.
 - Explanations now carry `why`, `detail` (exact names, commands, paths) and `action` besides the plain summary. Terminal shows summary + action; the dashboard shows Why, What to do, and a collapsible Technical detail. Prior: summary + one-sentence why.
