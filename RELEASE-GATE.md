@@ -17,7 +17,15 @@ Run everything (from the repository root):
 
 Extra cases: `test_1b_missing_signature_fails_closed`, `test_3b_same_seq_replacement`.
 
+## Autopilot tests (0.2.0)
+All run in `python3 -m unittest discover -s tests -v`: `tests/test_semantic.py` (diff classes, secrets
+never stored), `tests/test_autopilot.py` (settle timing and reset, escalate-only LLM against a fake
+loopback backend including prompt injection and backend down, remote refusal, alert dedup, dashboard
+escaping and no external assets, quarantine refusal, install-user, the 5,000-file break test).
+
 ## What the human must do once (the agent never does these)
+With autopilot the human steps shrink to the one-time key, `install-root.sh` and `install-user.sh`;
+after that only risk-raising changes ask for a signature.
 1. Generate a passphrase-protected signing key: `ssh-keygen -t ed25519 -f ~/.ssh/agent_integrity_signing`
 2. `sudo ./install-root.sh --pubkey ~/.ssh/agent_integrity_signing.pub --user-home "$HOME"`
 3. `python3 agent_integrity.py baseline`, review, then `python3 agent_integrity.py sign --key ~/.ssh/agent_integrity_signing`

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0 (2026-10-16)
+
+### What changed
+- `watch`, `report --html` and `quarantine KEY` commands; `install-user.sh`.
+- Semantic config diff with a per-change plain-English line and risk class.
+- Rolling trust overlay (`accepted.json`) with rule R-settle: neutral, clean changes auto-accept after
+  `trust_after` (24h). Raising changes still need `sign`.
+- Optional local-LLM explainer (`--explain`), escalate-only, loopback only unless `explain_allow_remote`.
+- Alerts on new raising items only, and a self-contained HTML dashboard.
+- Manifests now carry normalized config fingerprints (secrets and long strings hashed).
+- Every output states `mode: protected` or `mode: unprotected (detection only)`.
+
+### Prior behavior
+0.1.0 reported every byte-level change and a human reviewed and re-signed all of them, which does not
+scale and hid the one dangerous change among harmless ones.
+
+### Why
+The reviewer's attention should go only where a change can raise what an agent is allowed to do.
+The model is advisory and can only raise a risk, because attacker-written file text must never be able
+to talk the tool into accepting it.
+
 ## 0.1.0 (unreleased, 2026-10-16)
 
 First standalone release, extracted from a single-user script and hardened.

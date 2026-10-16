@@ -29,6 +29,47 @@ reports any change (`agent_integrity.py`).
 - `baseline` refuses to bless a new or changed file that has an unreviewed high-severity hit.
 - Exports `--format text|json|sarif` (SARIF 2.1.0, one rule per signature).
 
+## Autopilot (0.2.0): the tool reviews drift; you sign only risk-raising changes
+
+Reviewing every change by hand does not scale, so `watch` does the first pass.
+
+- **Semantic diff.** Config files (Claude `settings*.json`, `~/.claude.json` `mcpServers`, `.mcp.json`,
+  Codex `config.toml`, Cursor `mcp.json`) are compared as parsed structure, not bytes. Each change
+  gets a plain-English line and a risk: `neutral` (model, theme, a permission `allow` removed, a
+  `deny` added), `review-soon` (a clean user-authored skill or rule), or `raising` (a hook or MCP
+  server added or changed, an `allow` added, a `deny` removed, the sandbox loosened, a
+  dangerous/bypass flag, a proxy or `*_BASE_URL` override). Anything the diff does not understand is
+  treated as raising. Secrets are hashed before they reach the manifest.
+- **Settling.** A neutral change with a clean scan is accepted on its own after `trust_after`
+  (default 24h) if it has not changed again and nothing escalated it. Raising changes never settle;
+  they need `sign` after you look at them.
+- **Local explainer (optional, `watch --explain`).** A small local model (Ollama, or any
+  OpenAI-compatible server on loopback) writes a one-line summary of each change. Escalate-only:
+  the final risk is the higher of the deterministic risk and the model's. The model can never lower
+  a risk, accept a change, or edit a baseline, because its input is attacker-controlled file text and
+  a poisoned file would simply tell it to say "safe". Any model failure falls back to the
+  deterministic text. File excerpts (at most 8 KB) are fenced with a random nonce and labelled
+  untrusted in the prompt.
+- **Alerts and dashboard.** Desktop notification (and an optional webhook) only for a new raising
+  item, a threat, STALE, untrusted or rollback; review-soon items batch into one alert a day.
+  `watch --html PATH` or `report --html PATH` writes one self-contained page (no scripts, no external
+  assets, light and dark) with the exact command for each red item.
+- **`quarantine KEY`** moves a flagged file into `<user dir>/quarantine/<time>/` and prints the
+  restore command. It refuses any path that is not one of the watched surfaces.
+- `install-user.sh` (no sudo) schedules `watch --explain` hourly via a LaunchAgent or systemd user
+  timer; `--uninstall` removes it.
+
+`explain_allow_remote` (config, default `false`). The explainer refuses any non-loopback backend.
+Setting it to `true` sends the content of changed agent files, which can include secrets you
+pasted into them, to that remote host. Leave it off unless you accept that.
+
+| | Protected (root install) | Unprotected (user mode) |
+|---|---|---|
+| Baseline and settle overlay | root-owned store; an agent running as you cannot edit them | in your user directory; an agent running as you could rewrite them |
+| Output label | `mode: protected` | `mode: unprotected (detection only)` on every output |
+| Auto-accept (settle) | written by the root daemon | written by `watch`, so only as trustworthy as your account |
+| `escalations.json` (user side) | read as hold-only input: forging it can delay a settle, never cause one | same |
+
 ## Threat model, honestly
 
 Read this before you rely on it.
@@ -104,7 +145,8 @@ python3 agent_integrity.py baseline --i-reviewed <sha256-prefix>   # per-file ov
 python3 agent_integrity.py status                 # what the root job last recorded
 ```
 
-After you legitimately change a watched file: `baseline`, review, `sign`.
+After you legitimately change a watched file: `baseline`, review, `sign`. With autopilot you only do
+this for risk-raising changes; `watch` handles the rest.
 
 ## Tests
 
