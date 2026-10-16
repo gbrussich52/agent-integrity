@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 (unreleased)
+- Explanations end in a concrete fix chosen by the kind of change: added → "Remove X unless you added it"; removed → "Put it back"; turned off → "Turn it back on"; changed → "Change it back"; possible key leak → also rotate it. Sentence 2 says the real-world result ("it downloads and runs code from the internet"). Prior: actions were mostly "Review X". Why: a Claude reader scored the old text about 3.3 of 5 for clarity, mainly because "Review X" does not tell a non-expert what to do.
+- gpt-oss runs with `think: "low"`, `num_ctx` 8192, and a 60 s default `explain_timeout` (was 30 s). Prior: gpt-oss answers took 25–37 s, so many calls timed out, and two timeouts end the explainer run. Answers now take about 5 s.
+- Default explainer model order: gpt-oss, then gemma3, then llama3 (was gemma3 first). Why: bench average gpt-oss 96% over 3 runs vs gemma3 73%.
+- Bench: `action_concrete` check; results are now read as three-run averages.
+- Text output no longer drops a file's 4th+ change silently; it prints `...+N more change(s)` (previously cut at 3 with no notice).
+
 ## 0.3.0 (unreleased)
 
 ### What changed

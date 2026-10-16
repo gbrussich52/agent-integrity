@@ -85,6 +85,10 @@ def score(sc: dict, raw: str) -> dict:
     checks["mentions_facts"] = bool(summary) and not missing
     first = re.sub(r"[^a-z\-]", "", (action.replace("\u2011", "-").split() or [""])[0].lower()).replace("-", "")
     checks["action_imperative"] = bool(action) and (first in VERBS or action.lower().startswith("nothing to do"))
+    fix = ("remove", "revert", "restore", "delete", "turn", "put", "pin", "rotate", "undo", "uninstall", "disable", "keep",
+           "add", "change", "set")   # concrete edits; "Review X" / "Check X" alone are not
+    checks["action_concrete"] = action.lower().startswith("nothing to do") or any(
+        re.search(rf"\b{f}\b", action.lower()) for f in fix)   # "Review X" alone is not a fix (judge round 1)
     checks["risk_floor"] = v.get("risk") in RANK and RANK[v["risk"]] >= RANK[sc["floor"]]
     return {"id": sc["id"], "pass": all(checks.values()), "checks": checks, "flesch": round(fre, 1),
             "missing": missing, "answer": v or raw[:400]}
@@ -125,7 +129,7 @@ def main() -> int:
         r = score(sc, raw)
         r["seconds"] = round(time.time() - t0, 1)
         rows.append(r)
-    names = ["valid_json", "summary_short", "readable", "no_jargon", "mentions_facts", "action_imperative", "risk_floor"]
+    names = ["valid_json", "summary_short", "readable", "no_jargon", "mentions_facts", "action_imperative", "action_concrete", "risk_floor"]
     print(f"{'scenario':<24}{'pass':<6}{'flesch':<8}" + " ".join(n[:6] for n in names))
     for r in rows:
         print(f"{r['id']:<24}{'PASS' if r['pass'] else 'FAIL':<6}{r['flesch']:<8}" +
