@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (unreleased)
+- Explainer: no per-run count cap by default (`--explain-max 0`). Prior: 10 fresh calls per run. Why: the model is local and free; a 20-minute time budget (was 3) still keeps hourly runs from overlapping, and leftovers are explained next run from the cache.
+- Explanations now carry `why`, `detail` (exact names, commands, paths) and `action` besides the plain summary. Terminal shows summary + action; the dashboard shows Why, What to do, and a collapsible Technical detail. Prior: summary + one-sentence why.
+- `quarantine` refuses entries inside shared files (`~/.claude.json#mcpServers`); the dashboard suggests removing the entry by hand instead.
+
 ## 0.2.0 (2026-10-16)
 
 ### What changed
