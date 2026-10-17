@@ -184,7 +184,7 @@ Read this before you rely on it.
 Fetch, read, then run. There is deliberately no pipe-to-shell install.
 
 ```sh
-git clone <repository-url> agent-integrity    # URL is published with the first release
+git clone <this repository's URL> agent-integrity   # the green Code button on GitHub
 less agent-integrity/install-root.sh          # read it: it is short
 ```
 
