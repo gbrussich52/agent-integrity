@@ -163,6 +163,8 @@ python3 agent_integrity.py loops status                           # approved / c
 - With a signed loops manifest, `check` also reports plists that are not in it or differ from it. Set
   `"loops_enforce": true` in the root-owned `config.json` and the root daemon boots those jobs out
   (`launchctl bootout`); it never deletes or rewrites the file.
+  `install-root.sh --enforce-loops` and `--notify-arg ARG` (repeatable, the `loops_notify_cmd` argv) write
+  those two keys for you, so a re-run of the installer keeps them.
 
 Limits, said plainly. Shell and python discovery is static: a script that builds the path of a file
 from data at run time (`source "$X/lib.sh"` with `X` set elsewhere, `importlib`, `exec`, `eval`) can

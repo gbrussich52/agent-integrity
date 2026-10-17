@@ -6,7 +6,9 @@
 # What it does:
 #   1. creates a root-owned store (default below) the agent's user account cannot write
 #   2. copies the verifier (agent_integrity.py) and your PUBLIC signing key (as allowed_signers) into it
-#   3. writes config.json telling the verifier a fresh root heartbeat is required
+#   3. writes config.json telling the verifier a fresh root heartbeat is required (optional:
+#      --notify-arg ARG, repeatable = the command the loop gate runs when it refuses a job;
+#      --enforce-loops = the root daemon boots out launch agents that are not approved)
 #   4. installs a root launchd daemon (macOS) or systemd timer (Linux) that runs `check` hourly
 #
 # What it never does: touch your private key, your agent configs, or anything outside the store
@@ -22,7 +24,9 @@ STORE="$STORE_DEFAULT"
 SERVICE_DIR="$SERVICE_DIR_DEFAULT"
 PUBKEY=""
 USER_HOME=""
-PROJECTS=""
+PROJECTS_JSON=""
+NOTIFY_JSON=""
+ENFORCE_LOOPS=0
 INTERVAL=3600
 NO_SERVICE=0
 UNINSTALL=0
@@ -31,12 +35,17 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 usage() { sed -n '2,16p' "$0"; exit "${1:-2}"; }
 
+# Minimal JSON string escaper for values that go into config.json (paths, argv elements).
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"; }
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --store) STORE="$2"; shift 2 ;;
     --pubkey) PUBKEY="$2"; shift 2 ;;
     --user-home) USER_HOME="$2"; shift 2 ;;
-    --project) PROJECTS="$PROJECTS $2"; shift 2 ;;
+    --project) PROJECTS_JSON="${PROJECTS_JSON:+$PROJECTS_JSON,}$(json_str "$2")"; shift 2 ;;
+    --notify-arg) NOTIFY_JSON="${NOTIFY_JSON:+$NOTIFY_JSON,}$(json_str "$2")"; shift 2 ;;   # repeatable: loops_notify_cmd argv
+    --enforce-loops) ENFORCE_LOOPS=1; shift ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --service-dir) SERVICE_DIR="$2"; shift 2 ;;
     --no-service) NO_SERVICE=1; shift ;;
@@ -82,14 +91,13 @@ cp "$HERE/agent_integrity.py" "$STORE/agent_integrity.py"
 # The principal and namespace pin this key to agent-integrity signatures only.
 printf 'agent-integrity namespaces="agent-integrity" %s %s\n' "$KEYTYPE" "$KEYBODY" > "$STORE/allowed_signers"
 
-PROJ_JSON="[]"
-if [ -n "$PROJECTS" ]; then
-  PROJ_JSON="["; sep=""
-  for p in $PROJECTS; do PROJ_JSON="$PROJ_JSON$sep\"$p\""; sep=","; done
-  PROJ_JSON="$PROJ_JSON]"
-fi
+# Root-owned config: the loop gate reads loops_notify_cmd / loops_enforce from here, never from the
+# user account, so an agent cannot point the alert at itself or switch enforcement off.
+CONFIG_EXTRA=""
+[ -z "$NOTIFY_JSON" ] || CONFIG_EXTRA="$CONFIG_EXTRA, \"loops_notify_cmd\": [$NOTIFY_JSON]"
+[ "$ENFORCE_LOOPS" -eq 0 ] || CONFIG_EXTRA="$CONFIG_EXTRA, \"loops_enforce\": true"
 cat > "$STORE/config.json" <<EOF
-{"heartbeat_required": true, "stale_after": $((INTERVAL * 3)), "home": "$USER_HOME", "projects": $PROJ_JSON}
+{"heartbeat_required": true, "stale_after": $((INTERVAL * 3)), "home": $(json_str "$USER_HOME"), "projects": [$PROJECTS_JSON]$CONFIG_EXTRA}
 EOF
 
 # Root ownership is what makes the store tamper-resistant. chown only when we are really root.

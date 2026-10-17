@@ -139,6 +139,23 @@ class InstallTests(Env):
                               str(store), "--home", str(self.home), "--quiet"], capture_output=True, text=True)
         self.assertNotIn("unrecognized arguments", out.stderr)
 
+    def test_config_carries_notify_cmd_enforce_and_awkward_paths_as_valid_json(self):
+        # The gate trusts loops_notify_cmd / loops_enforce only from this root-written file, and
+        # --project used to be word-split. Values with spaces and quotes must survive as JSON.
+        store, svc = self.tmp / "s", self.tmp / "svc"
+        proj = 'my proj "x"'
+        r = self.run_install(*self.args(store, svc), "--project", proj, "--project", "/b",
+                             "--notify-arg", "/bin/sh", "--notify-arg", "/opt/my dir/n.sh", "--enforce-loops")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cfg = json.loads((store / "config.json").read_text())
+        self.assertEqual(cfg["projects"], [proj, "/b"])
+        self.assertEqual(cfg["loops_notify_cmd"], ["/bin/sh", "/opt/my dir/n.sh"])
+        self.assertIs(cfg["loops_enforce"], True)
+        r = self.run_install(*self.args(self.tmp / "s2", svc))
+        cfg = json.loads((self.tmp / "s2" / "config.json").read_text())
+        self.assertNotIn("loops_notify_cmd", cfg)
+        self.assertNotIn("loops_enforce", cfg)
+
     def baseline_to(self, store):
         return self.run_tool("baseline", "--pending-dir", str(self.pending), store=store)
 

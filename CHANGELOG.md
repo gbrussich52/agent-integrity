@@ -41,6 +41,13 @@ anything running as the user could edit them and the next unattended run would d
   containing a space (`/Library/Application Support/...`) became two arguments and the daemon failed
   with "unrecognized arguments" on every run. Each argument is now written as its own element (and
   XML-escaped; quoted for systemd). A test installs into a path with spaces and parses the plist back.
+- `install-root.sh --project` was also word-split (a project path with a space became two). Projects
+  are now JSON-escaped one by one.
+
+### Added (installer)
+- `install-root.sh --notify-arg ARG` (repeatable) writes `loops_notify_cmd` and `--enforce-loops` writes
+  `loops_enforce: true` into the root-owned `config.json`; before, the only way to set them was to edit
+  that file by hand as root, and every re-run of the installer erased them.
 
 ### Why
 Approving a job once should be enough for it to keep running on its schedule, and any change to what it
