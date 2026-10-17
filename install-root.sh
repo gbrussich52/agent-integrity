@@ -102,7 +102,13 @@ chmod 644 "$STORE/allowed_signers" "$STORE/config.json"
 chmod 755 "$STORE/agent_integrity.py"
 
 CMD_PY="$STORE/agent_integrity.py"
-CHECK_ARGS="check --tier all --store $STORE --home $USER_HOME --write-heartbeat --quiet"
+# One positional parameter per argument. Building this as a single string and word-splitting it
+# broke any path with a space ("/Library/Application Support/..."), so the daemon failed on every run.
+set -- check --tier all --store "$STORE" --home "$USER_HOME" --write-heartbeat --quiet
+
+xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+# systemd splits ExecStart on whitespace unless an argument is double-quoted; % starts a specifier.
+sd_quote() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g')"; }
 
 if [ "$NO_SERVICE" -eq 0 ] || [ -n "${AGENT_INTEGRITY_ALLOW_NONROOT:-}" ]; then
   mkdir -p "$SERVICE_DIR"
@@ -112,16 +118,18 @@ if [ "$NO_SERVICE" -eq 0 ] || [ -n "${AGENT_INTEGRITY_ALLOW_NONROOT:-}" ]; then
       echo '<?xml version="1.0" encoding="UTF-8"?>'
       echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
       echo '<plist version="1.0"><dict>'
-      echo "<key>Label</key><string>$LABEL</string>"
+      echo "<key>Label</key><string>$(xml_esc "$LABEL")</string>"
       echo '<key>ProgramArguments</key><array>'
       echo '<string>/usr/bin/python3</string>'
-      echo "<string>$CMD_PY</string>"
-      for a in $CHECK_ARGS; do echo "<string>$a</string>"; done
+      echo "<string>$(xml_esc "$CMD_PY")</string>"
+      for a in "$@"; do echo "<string>$(xml_esc "$a")</string>"; done
       echo '</array>'
       echo "<key>StartInterval</key><integer>$INTERVAL</integer>"
+      # A new or edited launch agent re-runs the check at once instead of waiting out the hour.
+      echo "<key>WatchPaths</key><array><string>$(xml_esc "$USER_HOME/Library/LaunchAgents")</string></array>"
       echo '<key>RunAtLoad</key><true/>'
-      echo "<key>StandardOutPath</key><string>$STORE/last-run.log</string>"
-      echo "<key>StandardErrorPath</key><string>$STORE/last-run.log</string>"
+      echo "<key>StandardOutPath</key><string>$(xml_esc "$STORE/last-run.log")</string>"
+      echo "<key>StandardErrorPath</key><string>$(xml_esc "$STORE/last-run.log")</string>"
       echo '</dict></plist>'
     } > "$PLIST"
     chmod 644 "$PLIST"
@@ -131,13 +139,15 @@ if [ "$NO_SERVICE" -eq 0 ] || [ -n "${AGENT_INTEGRITY_ALLOW_NONROOT:-}" ]; then
       launchctl bootstrap system "$PLIST"
     fi
   else
+    EXEC_LINE="/usr/bin/python3 $(sd_quote "$CMD_PY")"
+    for a in "$@"; do EXEC_LINE="$EXEC_LINE $(sd_quote "$a")"; done
     cat > "$SERVICE_DIR/agent-integrity.service" <<EOF
 [Unit]
 Description=agent-integrity check
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 $CMD_PY $CHECK_ARGS
+ExecStart=$EXEC_LINE
 EOF
     cat > "$SERVICE_DIR/agent-integrity.timer" <<EOF
 [Unit]

@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+### What changed
+- **Approved scheduled jobs ("loops").** A second signed manifest, `loops.json` (+ `.sig`, own rollback
+  mark `loops_last_seen.json`), signed with the same key and `allowed_signers`. It carries `"kind": "loops"`;
+  `check`, `promote` and the gate refuse a manifest whose kind is not the one they expect, so the main
+  manifest's signature cannot stand in for it (and the other way round). Per job it records the exact
+  argv, working directory, environment, schedule keys, the sha256 of the gated plist, and the sha256 of
+  every file the job can run: argv files, `PROMPT.md`/`prompt.md` beside the program, sourced shell
+  helpers and imported python modules (depth 5), caller-supplied extra files, plus one opaque extra
+  blob stored as a sha256 only.
+- **`run-loop LABEL` (the gate).** A job's plist is rewritten to start the root-owned copy of this tool
+  with `run-loop LABEL`. The gate verifies the signature and sequence, re-hashes the plist and the file
+  set, and either `execve`s the approved argv with the approved cwd and env (inherited environment
+  dropped, `PATH` reset) or exits 3, appends a line to `loops-refused.jsonl`, runs the optional
+  `loops_notify_cmd` (argv list, message as last argument, 10 s timeout, failure ignored) and runs nothing.
+  New store config keys: `loops_notify_cmd`, `loops_forbid_dirs` (a file set touching one is refused),
+  `loops_enforce`.
+- **`loops propose | sign | apply | unadopt | status`.** `propose` (no sudo) builds a pending manifest
+  and staged gated plists and prints a review with signature-scan hits; it understands plists that are
+  already gated by reading the originals from the signed manifest. `apply` backs up each replaced plist
+  and reloads it. `unadopt LABEL` restores the backup. `status [--json]` reports approved, changed,
+  unapproved, not-gated or missing per label.
+- **Root watcher.** `check` reports plists that are not in the loops manifest or differ from it. With
+  `loops_enforce: true` the root daemon runs `launchctl bootout gui/<uid>/<label>` for them and records
+  `loops-drift` and `loops-bootout` events in the trail. Plists you do not gate are adopted as
+  *pinned* entries (hash only). The path of `launchctl` can be overridden with
+  `AGENT_INTEGRITY_LAUNCHCTL` (tests). The root daemon plist gains `WatchPaths` on the user's
+  LaunchAgents directory, so a new or edited plist is checked at once instead of within the hour.
+- `ssh-keygen` is now called by absolute path when one exists in a system location, instead of through `PATH`.
+
+### Prior behavior
+Nothing watched scheduled jobs. A job's plist, script, prompt file and helpers were ordinary files, so
+anything running as the user could edit them and the next unattended run would do what the edit said.
+`check` only compared the files listed in `manifest.json`.
+
+### Fixed
+- `install-root.sh` built the daemon's arguments as one string and word-split it, so a store path
+  containing a space (`/Library/Application Support/...`) became two arguments and the daemon failed
+  with "unrecognized arguments" on every run. Each argument is now written as its own element (and
+  XML-escaped; quoted for systemd). A test installs into a path with spaces and parses the plist back.
+
+### Why
+Approving a job once should be enough for it to keep running on its schedule, and any change to what it
+runs should need your signature, not an agent's. The gate puts that decision at run time, where the
+risk is, rather than only at the next scan.
+
 ## 0.3.1 (unreleased)
 - Explanations end in a concrete fix chosen by the kind of change: added → "Remove X unless you added it"; removed → "Put it back"; turned off → "Turn it back on"; changed → "Change it back"; possible key leak → also rotate it. Sentence 2 says the real-world result ("it downloads and runs code from the internet"). Prior: actions were mostly "Review X". Why: a Claude reader scored the old text about 3.3 of 5 for clarity, mainly because "Review X" does not tell a non-expert what to do.
 - gpt-oss runs with `think: "low"`, `num_ctx` 8192, and a 60 s default `explain_timeout` (was 30 s). Prior: gpt-oss answers took 25–37 s, so many calls timed out, and two timeouts end the explainer run. Answers now take about 5 s.

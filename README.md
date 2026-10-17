@@ -133,6 +133,45 @@ later `sign` that covers the exact contents closes a finding. Each rule is teste
 over several months (`tests/test_slowdrift.py`). Rule 1 mostly catches a forged or buggy overlay or a
 classifier miss, since a correct classifier already flags a raising step the moment it happens.
 
+## Approved scheduled jobs (0.4.0)
+
+A scheduled job (a launchd agent) runs unattended with your permissions. Its plist, its script, a
+`PROMPT.md` it feeds a model and every helper it sources are all code an agent running as you could
+edit. `loops` makes approval the thing that lets a job run, and a change the thing that stops it.
+
+```sh
+python3 agent_integrity.py loops propose --label my.job          # or: --all --prefix my.   (no sudo)
+python3 agent_integrity.py loops sign --key ~/.ssh/agent_integrity_signing --sign-only
+sudo python3 agent_integrity.py promote --loops --store ... --pending-dir ...   # the line sign prints
+python3 agent_integrity.py loops apply                            # install the gated plists, reload
+python3 agent_integrity.py loops status                           # approved / changed / unapproved / not gated
+```
+
+- `propose` lists, per job, what is new or changed (argv, files, schedule), with scanner hits on new or
+  changed files. It writes a *pending* manifest and the gated plists to a staging folder; nothing runs
+  differently until you sign, promote and apply.
+- `loops apply` backs up each plist it replaces under the user directory and reloads it.
+  `loops unadopt LABEL` puts the original back.
+- After `apply`, the plist starts `run-loop LABEL` from the root-owned store. The gate verifies the signed
+  list, re-hashes the plist and the job's file set, and then runs the **approved** argv, cwd and env, never
+  anything read from the plist or the caller's environment. If anything differs, it exits 3, writes
+  `loops-refused.jsonl`, calls `loops_notify_cmd` if you set one, and does not run the job.
+- The file set is: argv files, `PROMPT.md`/`prompt.md` beside the program, shell `source` / `.` targets
+  and python imports (depth 5), and anything you pin with `--extra-files label=path,...`
+  (or `--extra-files-json`). `--extra-json FILE --extra-list KEY --extra-id FIELD` pins, per job, the
+  canonical JSON of its entry in a file you keep, as a sha256 only.
+- With a signed loops manifest, `check` also reports plists that are not in it or differ from it. Set
+  `"loops_enforce": true` in the root-owned `config.json` and the root daemon boots those jobs out
+  (`launchctl bootout`); it never deletes or rewrites the file.
+
+Limits, said plainly. Shell and python discovery is static: a script that builds the path of a file
+from data at run time (`source "$X/lib.sh"` with `X` set elsewhere, `importlib`, `exec`, `eval`) can
+load a file the tool cannot see; `propose` prints a note when it cannot resolve a path, and you can pin
+the file by hand. Interpreters and binaries under OS-protected folders (`/usr/bin`, `/bin`, `/System`)
+are not hashed; others, such as a Homebrew python, are. A program that reads a data file you did not
+list (a config, a queue) is only as safe as that file. The gate protects the job's definition, not the
+data it works on.
+
 ## Explanation clarity benchmark (`bench/`)
 
 `bench/run.py --model gpt-oss:20b` runs the real explainer prompt on 15 realistic changes against a
@@ -226,8 +265,8 @@ this for risk-raising changes; `watch` handles the rest.
 python3 -m unittest discover -s tests -v
 ```
 
-The suite includes the four tamper tests that gate a release (`tests/test_tamper.py`; see
-`RELEASE-GATE.md`) and a test that fails if internal names or secrets leak into this tree.
+The suite includes the four tamper tests and the loop-gate tests that gate a release
+(`tests/test_tamper.py`, `tests/test_loops.py`; see `RELEASE-GATE.md`) and a test that fails if internal names or secrets leak into this tree.
 
 ## License
 

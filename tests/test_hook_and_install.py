@@ -114,6 +114,31 @@ class InstallTests(Env):
         s = subprocess.run([sys.executable, str(SCRIPT), "status", "--store", str(store)], capture_output=True, text=True)
         self.assertEqual(s.returncode, 0, s.stdout)
 
+    def test_store_path_with_a_space_stays_one_argument(self):
+        # Release gate: the root daemon once got "--store /Library/Application" and "Support/..." as two
+        # arguments and failed every hour. The path must reach the daemon as exactly one argument.
+        store, svc = self.tmp / "Application Support" / "agent integrity", self.tmp / "svc dir"
+        r = self.run_install(*self.args(store, svc))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        if sys.platform == "darwin":
+            pl = plistlib.loads((svc / "dev.agent-integrity.check.plist").read_bytes())
+            argv = pl["ProgramArguments"]
+            self.assertEqual(argv[argv.index("--store") + 1], str(store))
+            self.assertEqual(argv[argv.index("--home") + 1], str(self.home))
+            self.assertEqual(argv.count("--store"), 1)
+            self.assertEqual(argv[1], str(store / "agent_integrity.py"))
+            self.assertIn(str(self.home / "Library" / "LaunchAgents"), pl["WatchPaths"])
+            self.assertEqual(pl["StandardOutPath"], str(store / "last-run.log"))
+        else:
+            import shlex
+            line = [x for x in (svc / "agent-integrity.service").read_text().splitlines() if x.startswith("ExecStart=")][0]
+            argv = shlex.split(line[len("ExecStart="):])
+            self.assertEqual(argv[argv.index("--store") + 1], str(store))
+        # and the installed copy actually accepts those arguments (the old failure was an argparse error)
+        out = subprocess.run([sys.executable, str(store / "agent_integrity.py"), "check", "--tier", "all", "--store",
+                              str(store), "--home", str(self.home), "--quiet"], capture_output=True, text=True)
+        self.assertNotIn("unrecognized arguments", out.stderr)
+
     def baseline_to(self, store):
         return self.run_tool("baseline", "--pending-dir", str(self.pending), store=store)
 

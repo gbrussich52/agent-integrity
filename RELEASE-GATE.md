@@ -33,6 +33,25 @@ end-to-end). The 5,000-file break test stays at 20 lines or fewer.
 Not a CI gate: `bench/run.py --model gpt-oss:20b` needs a local model. Before a release, run it and
 record the pass rate in `bench/HISTORY.md`; it must be at least 90%.
 
+## Loop approval gate tests (0.4.0)
+`tests/test_loops.py`, run against a temp home, a temp job directory, a stand-in store and a mock
+`launchctl` (`AGENT_INTEGRITY_LAUNCHCTL`) that only logs its arguments. The nine release tests:
+1. a tampered script is refused (exit 3, nothing runs, refusal logged);
+2. a tampered `PROMPT.md` is refused (and a `prompt.md` that appears later);
+3. a tampered sourced helper is refused (and a changed imported python module);
+4. a plist pointed away from the gate is reported by `check` and, with `loops_enforce`, booted out (mock
+   `launchctl`), with `loops-bootout` in the trail; without it, only reported;
+5. a rolled-back `loops.json` is refused by the gate and by `promote --loops`;
+6. the main manifest and its valid signature cannot be installed or read as a loops manifest (and the
+   reverse);
+7. a failing, missing or hanging notify command still refuses, and repeated refusals are logged and
+   notified once per hour;
+8. the gate never runs argv taken from an edited plist or the caller's environment; the approved argv,
+   cwd and env run;
+9. an extra-blob mismatch (a registry entry edited) is refused, while an edit to another entry is not.
+`tests/test_hook_and_install.py` also installs into a store path containing a space, parses the daemon
+plist with `plistlib` and asserts `--store` is one element.
+
 ## What the human must do once (the agent never does these)
 With autopilot the human steps shrink to the one-time key, `install-root.sh` and `install-user.sh`;
 after that only risk-raising changes ask for a signature.
@@ -51,3 +70,5 @@ after that only risk-raising changes ask for a signature.
 - It does not run launchd or systemd, and `install-root.sh` is tested in a non-root test mode against
   temp directories.
 - Nothing here is a claim the tool detects every poisoned file (see the README).
+- The loop tests use a mock `launchctl`; they show the right commands are issued, not that launchd
+  honours them. Static discovery of sourced and imported files is a best effort (see the README).

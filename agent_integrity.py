@@ -23,6 +23,11 @@ invisible unicode).
   diff      --since 30d|90d|180d|365d|signed: everything that differs from then, in plain English
   verify-log   walk the tamper-evident audit trail and report the first broken line
   quarantine KEY   move a flagged watched file aside (restorable) instead of deleting it
+  loops     approved scheduled jobs: propose (review, no sudo), sign, apply (reload the gated
+            plists), unadopt LABEL (restore the original), status [--json]
+  run-loop LABEL   the gate a scheduled job's plist starts: verifies the signed loops manifest,
+            re-hashes the job's plist and every file it can run, then execs the approved argv or
+            exits 3 and runs nothing
 
 Exit codes: 0 clean, 1 drift or new signature hits, 2 no manifest / usage,
             3 manifest untrusted (bad or missing signature, rollback), 4 STALE heartbeat.
@@ -32,6 +37,7 @@ Honest limits are in README.md. Stdlib only. macOS first, Linux paths included.
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import gzip
 import hashlib
@@ -40,6 +46,7 @@ import ipaddress
 import json
 import os
 import platform
+import plistlib
 import re
 import secrets
 import shlex
@@ -58,7 +65,7 @@ try:                       # advisory file locking for the audit log; absent on 
 except ImportError:        # pragma: no cover
     fcntl = None
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 NAMESPACE = "agent-integrity"   # ssh-keygen -Y namespace: a signature made for another purpose won't verify
 PRINCIPAL = "agent-integrity"
 SELF = Path(__file__).resolve()
@@ -183,6 +190,11 @@ class Store:
         self.heartbeat = self.root / "heartbeat.json"
         self.config_path = self.root / "config.json"
         self.allow_path = self.root / "allow.json"
+        # Approved scheduled jobs live in their own signed file with their own rollback mark, so
+        # approving a loop never re-blesses the agent files in manifest.json (and vice versa).
+        self.loops = self.root / "loops.json"
+        self.loops_sig = self.root / "loops.json.sig"
+        self.loops_last_seen = self.root / "loops_last_seen.json"
 
     def config(self) -> dict:
         return load_json(self.config_path)
@@ -383,6 +395,16 @@ def unreviewed_high(p: Path, digest: str, allow: dict, reviewed: set[str] = froz
 
 
 # --- Signed manifest -----------------------------------------------------------------------
+def ssh_keygen_bin() -> str:
+    """Absolute path to ssh-keygen, never a PATH lookup: the loop gate runs as the user, and a
+    same-user attacker can `launchctl setenv PATH` to put an impostor first."""
+    for d in ("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"):
+        c = os.path.join(d, "ssh-keygen")
+        if os.access(c, os.X_OK):
+            return c
+    return "ssh-keygen"
+
+
 def verify_signature(store: Store, manifest_bytes: bytes, sig_path: Path | None = None) -> tuple[bool, str]:
     sig_path = sig_path or store.sig
     if not store.allowed.is_file():
@@ -391,7 +413,7 @@ def verify_signature(store: Store, manifest_bytes: bytes, sig_path: Path | None 
         return False, f"no signature file ({sig_path.name})"
     try:
         r = subprocess.run(
-            ["ssh-keygen", "-Y", "verify", "-f", str(store.allowed), "-I", PRINCIPAL,
+            [ssh_keygen_bin(), "-Y", "verify", "-f", str(store.allowed), "-I", PRINCIPAL,
              "-n", NAMESPACE, "-s", str(sig_path)],
             input=manifest_bytes, capture_output=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -405,22 +427,40 @@ class Untrusted(Exception):
     pass
 
 
-def load_trusted_manifest(store: Store) -> tuple[dict, str]:
-    """Verified manifest dict + its sha256, or raise Untrusted. Fails closed on every doubt."""
-    if not store.manifest.is_file():
+class NoLoops(Untrusted):
+    """There is no signed loops manifest at all (as opposed to one that fails to verify)."""
+
+
+def load_trusted_manifest(store: Store, kind: str = "files") -> tuple[dict, str]:
+    """Verified manifest dict + its sha256, or raise Untrusted. Fails closed on every doubt.
+    kind "loops" reads loops.json with its own signature and rollback mark."""
+    mpath, spath, mark = ((store.loops, store.loops_sig, store.loops_last_seen) if kind == "loops"
+                          else (store.manifest, store.sig, store.last_seen))
+    if not mpath.is_file():
+        if kind == "loops":
+            raise NoLoops("no signed loops manifest in store")
         raise Untrusted("no signed manifest in store")
-    raw = store.manifest.read_bytes()
-    ok, why = verify_signature(store, raw)
+    raw = mpath.read_bytes()
+    ok, why = verify_signature(store, raw, spath)
     if not ok:
         raise Untrusted(why)
     try:
         m = json.loads(raw)
+        got = m.get("kind", "files")
+    except (ValueError, AttributeError):
+        raise Untrusted("signed manifest is malformed")
+    if got != kind:
+        # Same key, same namespace: the kind field is what stops a signed loops manifest from
+        # standing in for the file manifest, and the other way round. Checked before anything else
+        # so the reason names the swap instead of calling the other kind "malformed".
+        raise Untrusted(f"manifest kind is {got!r}, expected {kind!r}")
+    try:
         seq, created = int(m["seq"]), str(m["created"])
-        m["files"]
+        m["jobs" if kind == "loops" else "files"]
     except (ValueError, KeyError, TypeError):
         raise Untrusted("signed manifest is malformed")
     msha = hashlib.sha256(raw).hexdigest()
-    last = load_json(store.last_seen)
+    last = load_json(mark)
     if last:
         if seq < int(last.get("seq", 0)):
             raise Untrusted(f"ROLLBACK: manifest seq {seq} is older than last seen {last['seq']}")
@@ -430,7 +470,7 @@ def load_trusted_manifest(store: Store) -> tuple[dict, str]:
             raise Untrusted(f"manifest at seq {seq} differs from the one last seen (replaced)")
     if not last or seq > int(last.get("seq", 0)):
         try:   # only root can; a user-run check just doesn't advance the mark
-            atomic_write(store.last_seen, json.dumps({"seq": seq, "created": created, "sha256": msha}))
+            atomic_write(mark, json.dumps({"seq": seq, "created": created, "sha256": msha}))
         except OSError:
             pass
     return m, msha
@@ -859,6 +899,8 @@ class Result:
         self.settling: list[dict] = []     # neutral items waiting out the cool-off
         self.fps: dict = {}                # key -> normalized structure (never serialized)
         self.truncated = False
+        # Scheduled jobs that differ from the signed loops manifest: {label, state, changes, enforce, action}
+        self.loops: list[dict] = []
         # Transient run state for the audit trail; never serialized.
         self.settled_items: list[dict] = []
         self._ctx = None
@@ -893,7 +935,8 @@ class Result:
                 "scanned": self.scanned, "counts": self.counts(), "mode": self.mode,
                 "auto_accepted": self.auto_accepted, "settled": self.settled, "risk": self.risk_tally(),
                 "settling": self.settling[:50], "notes": self.notes, "stale_why": self.stale_why,
-                "truncated": cap is not None and len(self.items) > cap, "items": items}
+                "truncated": cap is not None and len(self.items) > cap, "items": items,
+                "loops": self.loops[:200]}
 
     @classmethod
     def from_json(cls, d: dict) -> "Result":
@@ -908,6 +951,7 @@ class Result:
         r.scanned, r.notes = int(d.get("scanned", 0)), list(d.get("notes", []))
         r.mode, r.stale_why = str(d.get("mode", "unprotected")), str(d.get("stale_why", ""))
         r.settling, r.truncated = list(d.get("settling", [])), bool(d.get("truncated"))
+        r.loops = [x for x in d.get("loops", []) if isinstance(x, dict) and "label" in x]
         return r
 
 
@@ -916,7 +960,7 @@ def finalize(res: Result) -> None:
     if res.status in ("untrusted", "no-manifest"):
         return
     res.notes = [n for n in res.notes if not n.startswith("STALE:")]
-    if res.items:
+    if res.items or res.loops:
         res.status, res.exit, res.reason = "drift", EXIT_DRIFT, ""
         if res.stale_why:
             res.notes.append("STALE: " + res.stale_why)
@@ -1148,6 +1192,7 @@ def run_check(args, store: Store, user: Path | None = None) -> Result:
                               "lines": [] if bulk else [x[:300] for x in lines[:8]]})
 
     apply_escalations(res, load_escalations(user))
+    res.loops = loops_findings(store, home, cfg, res)
     res.stale_why = ""
     stale, why = heartbeat_state(store, cfg, now, args.stale_after or int(cfg.get("stale_after", DEFAULT_STALE_AFTER)))
     if daemon:
@@ -1191,6 +1236,8 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
         return out
     c = res.counts()
     head = f"AGENT FILE DRIFT (tier {res.tier}): {c['changed']} changed, {c['added']} added, {c['removed']} removed"
+    if not res.items:
+        head = f"AGENT LOOP DRIFT: {len(res.loops)} scheduled job(s) differ from the approved list"
     out = [head, ml]
     tally = res.risk_tally()
     if tally:
@@ -1200,7 +1247,10 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
     if res.settled:
         out.append(f"agent-integrity: auto-settled {res.settled} neutral change(s) after the cool-off (R-settle)")
     out.extend(res.notes)
+    out.extend(loop_lines(res.loops))
     footer = "Read each one before an agent loads it. Then: baseline, sign."
+    if not res.items:
+        footer = "Review each job, then: agent_integrity.py loops propose, loops sign."
     budget = max_lines - len(out) - 1
     if res.settling:
         budget -= 1
@@ -1368,8 +1418,14 @@ def cmd_check(args) -> int:
     head = None
     if args.write_heartbeat:
         scfg = store.config()
+        if res.loops and scfg.get("loops_enforce") is True:
+            enforce_loops(res, Path(args.home) if args.home else Path(scfg.get("home") or Path.home()))
         tr = trail_writer(store.root, res) if res.status in ("drift", "clean") and res.seq is not None else None
         if tr:
+            try:
+                record_loops(res, tr, now)
+            except OSError as e:
+                res.notes.append(f"audit trail not written: {e}")
             try:
                 record_changes(res, tr, now)    # before settling removes items from the result
             except OSError as e:
@@ -1557,24 +1613,39 @@ def record_sign(store: Store, args, pend: Path, prev: dict) -> None:
         print(f"agent-integrity: sign event not recorded: {e}", file=sys.stderr)
 
 
-def install_signed(store: Store, manifest_path: Path, sig_path: Path) -> None:
-    """Verify then install. Raises Untrusted on any failure, PermissionError if store is not writable."""
+def install_signed(store: Store, manifest_path: Path, sig_path: Path, kind: str = "files") -> None:
+    """Verify then install. Raises Untrusted on any failure, PermissionError if store is not writable.
+    kind "files" is manifest.json; kind "loops" is loops.json with its own rollback mark."""
     raw = manifest_path.read_bytes()
     ok, why = verify_signature(store, raw, sig_path)
     if not ok:
         raise Untrusted(why)
-    m = json.loads(raw)
-    seq, created = int(m["seq"]), str(m["created"])
-    last = load_json(store.last_seen)
+    try:
+        m = json.loads(raw)
+        got = m.get("kind", "files")
+    except (ValueError, AttributeError):
+        raise Untrusted("signed manifest is malformed")
+    if got != kind:
+        raise Untrusted(f"manifest kind is {got!r}, expected {kind!r}")
+    try:
+        seq, created = int(m["seq"]), str(m["created"])
+        m["jobs" if kind == "loops" else "files"]
+    except (ValueError, KeyError, TypeError):
+        raise Untrusted("signed manifest is malformed")
+    dest, dest_sig, mark = ((store.loops, store.loops_sig, store.loops_last_seen) if kind == "loops"
+                            else (store.manifest, store.sig, store.last_seen))
+    last = load_json(mark)
     if last and (seq <= int(last.get("seq", 0)) or created < str(last.get("created", ""))):
         raise Untrusted(f"seq {seq} does not advance past last seen {last.get('seq')}")
-    atomic_write(store.manifest, raw)
-    atomic_write(store.sig, sig_path.read_bytes())
-    atomic_write(store.last_seen, json.dumps({"seq": seq, "created": created,
-                                              "sha256": hashlib.sha256(raw).hexdigest()}))
+    atomic_write(dest, raw)
+    atomic_write(dest_sig, sig_path.read_bytes())
+    atomic_write(mark, json.dumps({"seq": seq, "created": created,
+                                   "sha256": hashlib.sha256(raw).hexdigest()}))
 
 
 def cmd_promote(args) -> int:
+    if getattr(args, "loops", False):
+        return promote_loops(args)
     store = Store(args.store)
     pend = Path(args.pending_dir)
     prev = load_json(store.manifest)
@@ -1594,18 +1665,24 @@ def cmd_promote(args) -> int:
 
 def cmd_sign(args) -> int:
     pend = Path(args.pending_dir)
-    mf = pend / "manifest.json"
+    loops = bool(getattr(args, "loops", False))
+    mf = pend / ("loops.json" if loops else "manifest.json")
     if not mf.is_file():
-        print("no pending manifest; run baseline first", file=sys.stderr)
+        print("no pending loops manifest; run loops propose first" if loops else "no pending manifest; run baseline first",
+              file=sys.stderr)
         return EXIT_USAGE
-    sigf = pend / "manifest.json.sig"
+    sigf = pend / (mf.name + ".sig")
     if sigf.exists():
         sigf.unlink()
     # Inherits the terminal: ssh-keygen prompts for the passphrase itself; this process never sees it.
-    r = subprocess.run(["ssh-keygen", "-Y", "sign", "-f", args.key, "-n", NAMESPACE, str(mf)])
+    r = subprocess.run([ssh_keygen_bin(), "-Y", "sign", "-f", args.key, "-n", NAMESPACE, str(mf)])
     if r.returncode != 0:
         print("signing failed", file=sys.stderr)
         return EXIT_USAGE
+    if getattr(args, "sign_only", False):
+        print(f"signed {mf}; now promote it into the root-owned store:\n"
+              f"  sudo python3 {SELF} promote{' --loops' if loops else ''} --store '{args.store}' --pending-dir '{pend}'")
+        return EXIT_CLEAN
     return cmd_promote(args)
 
 
@@ -3163,6 +3240,1070 @@ def cmd_quarantine(args) -> int:
     return EXIT_CLEAN
 
 
+# --- Approved scheduled jobs ("loops") -----------------------------------------------------
+# A scheduled job (a launchd agent) runs unattended with your permissions, so the plist, the
+# script, a PROMPT.md it feeds a model and every helper it sources are all code an attacker
+# running as you could edit. `loops` pins them: a signed loops.json lists, per job, the exact
+# argv/cwd/env and a sha256 of its whole file set. The job's plist is rewritten to start
+# `run-loop LABEL` (the gate) from the root-owned store, and the gate only execs the approved argv
+# after re-hashing everything. Anything else exits 3 and is logged, never run.
+LAUNCHCTL_ENV = "AGENT_INTEGRITY_LAUNCHCTL"       # tests only: the root watcher's launchctl
+LOOPS_DEPTH = 5
+SIP_DIRS = ("/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/", "/System/", "/usr/lib/", "/usr/libexec/")
+PROMPT_NAMES = ("PROMPT.md", "prompt.md")
+SHELL_EXT = {".sh", ".bash", ".zsh"}
+CORE_PLIST_KEYS = {"Label", "Program", "ProgramArguments", "WorkingDirectory", "EnvironmentVariables"}
+DEFAULT_JOB_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+KEEP_ENV = ("HOME", "USER", "LOGNAME", "SHELL", "TMPDIR")
+PROGRAM_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/opt/homebrew/bin")
+REFUSAL_DEDUPE = 3600
+REFUSAL_LOG_CAP = 1 << 20
+SCRIPT_DIR_EXPRS = ("$(dirname $0)", "$(dirname ${0})", "$(dirname ${BASH_SOURCE[0]})", "$(dirname $BASH_SOURCE)",
+                    "$(dirname ${BASH_SOURCE})", "${BASH_SOURCE%/*}", "${0%/*}", "$(dirname $0)")
+CD_PWD_RX = re.compile(r"\$\(\s*cd\s+\$\(dirname [^)]*\)\s*(?:&&|;)\s*pwd\s*\)")
+
+
+def launchctl_bin() -> str:
+    return os.environ.get(LAUNCHCTL_ENV) or "/bin/launchctl"
+
+
+def is_sip(path: str) -> bool:
+    """OS-owned locations an attacker running as the user cannot write: not worth hashing, and
+    hashing them would force a re-approval of every job on each OS update."""
+    return path.startswith(SIP_DIRS)
+
+
+def file_digest(path: str) -> str:
+    try:
+        if os.path.islink(path):
+            tgt = os.readlink(path)
+            try:
+                return f"link:{tgt}:{sha_file(Path(path))}"
+            except OSError:
+                return f"link:{tgt}:missing"
+        return sha_file(Path(path)) if os.path.isfile(path) else "missing"
+    except OSError:
+        return "unreadable"
+
+
+def under(path: str, directory: str) -> bool:
+    d = os.path.abspath(directory).rstrip(os.sep)
+    return path == d or path.startswith(d + os.sep)
+
+
+def forbid_dirs_of(cfg: dict, home: Path) -> list[str]:
+    out = []
+    for d in cfg.get("loops_forbid_dirs") or []:
+        if isinstance(d, str) and d:
+            out.append(str(home) + d[1:] if d.startswith("~/") else d)
+    return out
+
+
+def script_kind(path: str) -> str | None:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".py":
+        return "py"
+    if ext in SHELL_EXT:
+        return "sh"
+    try:
+        with open(path, "rb") as fh:
+            first = fh.read(160).split(b"\n")[0]
+    except OSError:
+        return None
+    if first.startswith(b"#!"):
+        if b"python" in first:
+            return "py"
+        if b"sh" in first:        # sh, bash, zsh
+            return "sh"
+    return None
+
+
+def read_script(path: str) -> str | None:
+    try:
+        if os.path.getsize(path) > MAX_SCAN_BYTES:
+            return None
+        return Path(path).read_text(errors="replace")
+    except OSError:
+        return None
+
+
+def first_shell_word(rest: str) -> str:
+    """The first shell word of `rest`, keeping $( ... ) and quoted parts whole, quotes removed."""
+    out, depth, quote = [], 0, ""
+    for ch in rest:
+        if depth == 0:
+            if quote:
+                if ch == quote:
+                    quote = ""
+                    continue
+            elif ch in "\"'":
+                quote = ch
+                continue
+            elif ch.isspace() or ch in ";&|)":
+                break
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        if depth and ch in "\"'":
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+SOURCE_RX = re.compile(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:source|\.)\s+(\S.*)$")
+
+
+def shell_refs(text: str, base_dir: str, cwd: str, home: str, notes: list[str], where: str) -> list[str]:
+    """Literal `source X` / `. X` targets. A path built from a variable is matched by its literal
+    tail against the script dir and the cwd; anything still unresolved is noted, never silently lost."""
+    found: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        m = SOURCE_RX.search(line)
+        if not m:
+            continue
+        raw = first_shell_word(m.group(1))
+        if not raw:
+            continue
+        s = CD_PWD_RX.sub(base_dir, raw)
+        for pat in SCRIPT_DIR_EXPRS:
+            s = s.replace(pat, base_dir)
+        s = s.replace("${HOME}", home).replace("$HOME", home)
+        if s.startswith("~/"):
+            s = home + s[1:]
+        cands: list[str]
+        if "$" in s or "`" in s:
+            parts = s.split("/")
+            i = max(k for k, x in enumerate(parts) if "$" in x or "`" in x)
+            tail = "/".join(parts[i + 1:])
+            cands = [os.path.join(base_dir, tail), os.path.join(cwd, tail)] if tail else []
+        elif os.path.isabs(s):
+            cands = [s]
+        else:
+            cands = [os.path.join(base_dir, s), os.path.join(cwd, s)]
+        hit = [c for c in cands if os.path.isfile(c)]
+        if hit:
+            found.extend(hit)
+        else:
+            notes.append(f"unresolved source {raw!r} in {where}")
+    return found
+
+
+def module_files(mod: str, roots: list[str]) -> list[str]:
+    parts = [x for x in mod.split(".") if x]
+    out: list[str] = []
+    for root in roots:
+        for i in range(1, len(parts) + 1):
+            base = os.path.join(root, *parts[:i])
+            for cand in (base + ".py", os.path.join(base, "__init__.py")):
+                if os.path.isfile(cand):
+                    out.append(cand)
+    return out
+
+
+def py_refs(text: str, path: str, roots: list[str], notes: list[str]) -> list[str]:
+    """Local modules the file imports (any nesting), found with ast; stdlib/site-packages never match
+    because only files under the script dir or the cwd count."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        notes.append(f"could not parse {path} for imports")
+        return []
+    out: list[str] = []
+    here = os.path.dirname(path)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                out.extend(module_files(a.name, roots))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = here
+                for _ in range(node.level - 1):
+                    base = os.path.dirname(base)
+                rts = [base]
+            else:
+                rts = roots
+            mod = node.module or ""
+            if mod:
+                out.extend(module_files(mod, rts))
+            for a in node.names:
+                if a.name != "*":
+                    out.extend(module_files((mod + "." if mod else "") + a.name, rts))
+    return out
+
+
+def discover_files(argv: list[str], program: str, cwd: str, home: str, extra: list[str]) -> tuple[list[str], list[str]]:
+    """The job's file set: argv files, PROMPT.md beside them, sourced shell helpers and imported
+    python modules (depth-capped), plus caller-supplied extras. OS-owned binaries are skipped."""
+    notes: list[str] = []
+    seen: dict[str, int] = {}
+    queue: list[tuple[str, int, str]] = []
+
+    def add(path: str, depth: int, main_dir: str) -> None:
+        path = os.path.abspath(path)
+        if path in seen or is_sip(path) or not os.path.exists(path):
+            return
+        seen[path] = depth
+        queue.append((path, depth, main_dir))
+
+    def resolve(a: str) -> str:
+        return a if os.path.isabs(a) or not cwd else os.path.join(cwd, a)
+
+    heads = [program] + list(argv)
+    for a in heads:
+        p = resolve(a)
+        if os.path.isfile(p):
+            add(p, 0, os.path.dirname(os.path.abspath(p)))
+            if not is_sip(os.path.abspath(p)):
+                for name in PROMPT_NAMES:
+                    add(os.path.join(os.path.dirname(os.path.abspath(p)), name), 0, "")
+    for i, a in enumerate(argv[:-1]):         # bash -c '... source x ...'
+        if re.fullmatch(r"-[a-zA-Z]*c", a):
+            for ref in shell_refs(argv[i + 1], cwd or "/", cwd or "/", home, notes, "inline -c script"):
+                add(ref, 1, cwd or "/")
+    for e in extra:
+        seen.setdefault(os.path.abspath(e), 0)
+    while queue:
+        path, depth, main_dir = queue.pop(0)
+        kind = script_kind(path)
+        text = read_script(path) if kind else None
+        if text is None:
+            continue
+        if depth >= LOOPS_DEPTH:
+            notes.append(f"depth cap {LOOPS_DEPTH} reached below {path}")
+            continue
+        base = os.path.dirname(path)
+        if kind == "sh":
+            refs = shell_refs(text, base, cwd or base, home, notes, path)
+        else:
+            refs = py_refs(text, path, [r for r in (main_dir, cwd) if r], notes)
+        for r in refs:
+            add(r, depth + 1, main_dir)
+    return sorted(seen), sorted(set(notes))
+
+
+def extra_blob_sha(source: dict, label: str) -> str | None:
+    """sha256 of the canonical JSON of one entry of a caller-named JSON file, or None if absent."""
+    try:
+        data = json.loads(Path(source["json"]).read_text())
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if source.get("list"):
+        data = data.get(source["list"]) if isinstance(data, dict) else None
+    idk = source.get("id") or "id"
+    for e in data if isinstance(data, list) else []:
+        if isinstance(e, dict) and e.get(idk) == label:
+            return hashlib.sha256(canonical_json(e).encode()).hexdigest()
+    return None
+
+
+def plist_label(d: dict, fallback: str) -> str:
+    lab = d.get("Label")
+    return lab if isinstance(lab, str) and lab else fallback
+
+
+def gate_label_of(d: dict) -> str | None:
+    """Label if this plist already starts the gate (read its originals from the signed manifest)."""
+    pa = d.get("ProgramArguments")
+    if isinstance(pa, list) and "run-loop" in pa and any(str(x).endswith("agent_integrity.py") for x in pa):
+        i = pa.index("run-loop")
+        return str(pa[i + 1]) if i + 1 < len(pa) else None
+    return None
+
+
+def read_plist(path: Path) -> tuple[dict, bytes] | None:
+    try:
+        raw = path.read_bytes()
+        d = plistlib.loads(raw)
+        return (d, raw) if isinstance(d, dict) else None
+    except (OSError, ValueError, plistlib.InvalidFileException, Exception):
+        return None
+
+
+def gated_plist_bytes(job: dict, python: str, script: str, store: str, home: str) -> bytes:
+    d = {"Label": job["label"],
+         "ProgramArguments": [python, "-I", script, "run-loop", job["label"], "--store", store, "--home", home]}
+    d.update(job.get("schedule") or {})
+    return plistlib.dumps(d, fmt=plistlib.FMT_XML, sort_keys=True)
+
+
+def evaluate_job(job: dict, home: Path, la_dir: Path, forbid: list[str]) -> tuple[str, list[dict]]:
+    """(state, problems) for one approved job against the machine as it is now. States: approved,
+    changed, missing, not-gated (the reviewed original plist, not yet applied). Each problem is
+    {kind: plist|file|extra|forbidden, path, detail}; `kind == plist` problems are the ones a root
+    watcher may act on."""
+    probs: list[dict] = []
+    p = la_dir / str(job.get("plist_name", ""))
+    state = "approved"
+    if not p.is_file():
+        return "missing", [{"kind": "plist", "path": str(p), "detail": "plist is missing"}]
+    sha = sha_file(p)
+    if sha != job.get("plist_sha"):
+        parsed = read_plist(p)
+        if job.get("mode") == "gated" and sha == job.get("orig_plist_sha") and parsed and not gate_label_of(parsed[0]):
+            return "not-gated", [{"kind": "plist", "path": str(p), "detail": "approved, but the plist still runs ungated; run loops apply"}]
+        probs.append({"kind": "plist", "path": str(p),
+                      "detail": "plist differs from the approved one"
+                                + (" (no longer starts the gate)" if job.get("mode") == "gated" and parsed
+                                   and not gate_label_of(parsed[0]) else "")})
+    if job.get("mode") == "gated":
+        approved = job.get("files") or {}
+        for path, dig in sorted(approved.items()):
+            now = file_digest(path)
+            if now != dig:
+                probs.append({"kind": "file", "path": path, "detail": "missing" if now == "missing" else "changed"})
+        try:
+            current, _n = discover_files(job.get("argv") or [], job.get("program") or "", job.get("cwd") or "",
+                                         str(home), job.get("extra_files") or [])
+        except Exception as e:      # a hostile script must not crash the gate into running anything
+            current = []
+            probs.append({"kind": "file", "path": "?", "detail": f"file-set discovery failed: {type(e).__name__}"})
+        for path in current:
+            if path not in approved:
+                probs.append({"kind": "file", "path": path, "detail": "new file in the job's file set"})
+        src = (job.get("extra") or {}).get("source")
+        if src:
+            if extra_blob_sha(src, job.get("label", "")) != (job.get("extra") or {}).get("sha"):
+                probs.append({"kind": "extra", "path": str(src.get("json", "")), "detail": "approved record changed or gone"})
+        for path in sorted(set(approved) | set(current)):
+            for d in forbid:
+                if under(path, d):
+                    probs.append({"kind": "forbidden", "path": path, "detail": f"under forbidden dir {d}"})
+    if probs:
+        state = "changed"
+    return state, probs
+
+
+def loops_states(jobs: dict, home: Path, la_dir: Path, forbid: list[str]) -> dict[str, dict]:
+    """Every label we know of: approved jobs evaluated, plus plists on disk with no entry."""
+    out: dict[str, dict] = {}
+    names: dict[str, str] = {}
+    for label, job in sorted(jobs.items()):
+        names[str(job.get("plist_name"))] = label
+        st, probs = evaluate_job(job, home, la_dir, forbid)
+        out[label] = {"state": st, "mode": job.get("mode"), "plist": job.get("plist_name"), "problems": probs,
+                      "changes": [f"{x['kind']}: {x['path']} ({x['detail']})" for x in probs[:20]],
+                      "boot_label": label}
+    try:
+        plists = sorted(la_dir.glob("*.plist"))
+    except OSError:
+        plists = []
+    for p in plists:
+        if p.name in names:
+            continue
+        parsed = read_plist(p)
+        label = plist_label(parsed[0], p.stem) if parsed else p.stem
+        key = label if label not in out else f"{label}@{p.name}"
+        out[key] = {"state": "unapproved", "mode": None, "plist": p.name, "boot_label": label,
+                    "problems": [{"kind": "plist", "path": str(p), "detail": "not in the approved list"}],
+                    "changes": ["plist is not in the approved list" if parsed else "unreadable plist, not in the approved list"]}
+    return out
+
+
+def refusal_tail(user: Path) -> list[dict]:
+    p = user / "loops-refused.jsonl"
+    try:
+        size = p.stat().st_size
+        with open(p, "rb") as fh:
+            fh.seek(max(0, size - 262144))
+            lines = fh.read().decode(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("label"):
+            out.append(d)
+    return out
+
+
+def log_refusal(user: Path, entry: dict) -> bool:
+    """Append one JSON line; False (and no write) if the same refusal was logged within the dedupe
+    window, so a KeepAlive job that respawns every few seconds does not flood the log."""
+    for d in reversed(refusal_tail(user)):
+        if d.get("label") == entry["label"]:
+            if d.get("reasons") == entry["reasons"] and entry["ts"] - int(d.get("ts", 0)) < REFUSAL_DEDUPE:
+                return False
+            break
+    p = user / "loops-refused.jsonl"
+    try:
+        user.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > REFUSAL_LOG_CAP:
+            os.replace(p, p.with_name(p.name + ".1"))
+        with open(p, "a") as fh:
+            fh.write(canonical_json(entry) + "\n")
+    except OSError:
+        pass
+    return True
+
+
+def run_notify(cfg: dict, msg: str, label: str, log: Path) -> None:
+    """Optional alert hook from the root-owned config. Its failure is deliberately invisible to the
+    gate: a broken notifier must never be a way to make a refusal turn into a run."""
+    cmd = cfg.get("loops_notify_cmd")
+    if not (isinstance(cmd, list) and cmd and all(isinstance(x, str) for x in cmd)):
+        return
+    env = {"PATH": DEFAULT_JOB_PATH, "AGENT_INTEGRITY_LOOP_LABEL": label, "AGENT_INTEGRITY_REFUSED_LOG": str(log)}
+    for k in KEEP_ENV:
+        if k in os.environ:
+            env[k] = os.environ[k]
+    try:
+        subprocess.run(cmd + [msg], timeout=10, env=env, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def gate_refuse(store: Store, user: Path, label: str, reasons: list[str], paths: list[str], now: float) -> int:
+    msg = f"agent-integrity refused to run {label}: " + "; ".join(clean_text(r, 160) for r in reasons[:3])
+    print(msg, file=sys.stderr)
+    entry = {"ts": int(now), "iso": datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="seconds"),
+             "label": label, "reasons": [clean_text(r, 200) for r in reasons[:20]],
+             "paths": [clean_text(x, 300) for x in paths[:20]]}
+    if log_refusal(user, entry):
+        run_notify(store.config(), msg, label, user / "loops-refused.jsonl")
+    return EXIT_UNTRUSTED
+
+
+def cmd_run_loop(args) -> int:
+    """The gate. Nothing the user account can write decides what runs: the argv, cwd and env come
+    from the signed manifest, and the inherited environment is dropped."""
+    store = Store(args.store)
+    home = Path(args.home) if args.home else Path.home()
+    user = Path(args.user_dir) if args.user_dir else home / ".agent-integrity"
+    now = args.now if args.now is not None else time.time()
+    label = args.label
+    try:
+        m, _ = load_trusted_manifest(store, "loops")
+    except Untrusted as e:
+        return gate_refuse(store, user, label, [f"loops manifest not trusted: {e}"], [], now)
+    job = (m.get("jobs") or {}).get(label)
+    if not isinstance(job, dict):
+        return gate_refuse(store, user, label, ["no approved entry for this job"], [], now)
+    if job.get("mode") != "gated":
+        return gate_refuse(store, user, label, ["entry is pinned, not runnable through the gate"], [], now)
+    la_dir = home / "Library" / "LaunchAgents"
+    state, probs = evaluate_job(job, home, la_dir, forbid_dirs_of(store.config(), home))
+    if state != "approved":
+        return gate_refuse(store, user, label, [f"{p['kind']} {p['detail']}: {p['path']}" for p in probs] or [state],
+                           [p["path"] for p in probs], now)
+    env = {"PATH": DEFAULT_JOB_PATH}
+    for k in KEEP_ENV:
+        if k in os.environ:
+            env[k] = os.environ[k]
+    env["HOME"] = str(home)
+    env.update({str(k): str(v) for k, v in (job.get("env") or {}).items()})
+    try:
+        if job.get("cwd"):
+            os.chdir(job["cwd"])
+        os.execve(job["program"], [str(x) for x in job["argv"]], env)
+    except OSError as e:
+        return gate_refuse(store, user, label, [f"approved program could not start: {e.strerror or e}"], [job.get("program", "")], now)
+    return EXIT_CLEAN      # unreachable: execve replaced this process
+
+
+# --- propose / sign / promote / apply / unadopt / status ------------------------------------
+def json_safe(v):
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, list):
+        return [json_safe(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): json_safe(x) for k, x in v.items()}
+    raise ValueError(f"unsupported plist value of type {type(v).__name__}")
+
+
+def resolve_program(prog: str) -> str:
+    if os.path.isabs(prog):
+        return prog
+    for d in PROGRAM_DIRS:
+        c = os.path.join(d, prog)
+        if os.access(c, os.X_OK) and os.path.isfile(c):
+            return c
+    raise ValueError(f"cannot resolve program {prog!r} to an absolute path")
+
+
+def parse_extra_files(args) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for spec in getattr(args, "extra_files", None) or []:
+        for pair in spec.split(","):
+            if "=" not in pair:
+                raise ValueError(f"--extra-files wants label=path, got {pair!r}")
+            lab, pth = pair.split("=", 1)
+            out.setdefault(lab.strip(), []).append(os.path.abspath(pth.strip()))
+    mp = getattr(args, "extra_files_json", None)
+    if mp:
+        data = json.loads(Path(mp).read_text())
+        for lab, v in (data.items() if isinstance(data, dict) else []):
+            for pth in ([v] if isinstance(v, str) else v):
+                out.setdefault(str(lab), []).append(os.path.abspath(str(pth)))
+    return out
+
+
+def make_job(label: str, name: str, d: dict, raw: bytes, prev: dict | None, ns: dict) -> dict:
+    gl = gate_label_of(d)
+    if gl:
+        if not prev or prev.get("mode") != "gated":
+            raise ValueError("this plist already starts the gate but the signed list has no entry for it; "
+                             "restore the original plist (loops unadopt) and propose again")
+        argv, program, cwd = list(prev["argv"]), prev["program"], prev.get("cwd") or ""
+        env, schedule, orig = dict(prev.get("env") or {}), dict(prev.get("schedule") or {}), prev.get("orig_plist_sha")
+    else:
+        pa = d.get("ProgramArguments")
+        argv = [str(x) for x in pa] if isinstance(pa, list) else ([str(d["Program"])] if d.get("Program") else [])
+        if not argv:
+            raise ValueError("plist has no ProgramArguments or Program")
+        program = resolve_program(str(d.get("Program") or argv[0]))
+        cwd = str(d.get("WorkingDirectory") or "")
+        env = {str(k): str(v) for k, v in (d.get("EnvironmentVariables") or {}).items()}
+        schedule = json_safe({k: v for k, v in d.items() if k not in CORE_PLIST_KEYS})
+        orig = hashlib.sha256(raw).hexdigest()
+    extra_files = sorted(set((prev or {}).get("extra_files") or []) | set(ns["extra_files"].get(label, [])))
+    for e in extra_files:
+        if not os.path.isfile(e):
+            raise ValueError(f"extra file does not exist: {e}")
+    files, notes = discover_files(argv, program, cwd, str(ns["home"]), extra_files)
+    job = {"label": label, "plist_name": name, "mode": "gated", "argv": argv, "program": program, "cwd": cwd,
+           "env": env, "schedule": schedule, "extra_files": extra_files, "orig_plist_sha": orig,
+           "files": {p: file_digest(p) for p in files}, "notes": notes}
+    src = ns["extra_source"] or ((prev or {}).get("extra") or {}).get("source")
+    if src:
+        sha = extra_blob_sha(src, label)
+        if sha:
+            job["extra"] = {"sha": sha, "source": src}
+        elif ns["extra_source"]:
+            job["notes"] = sorted(set(notes) | {"no record for this job in the extra JSON source"})
+    job["plist_sha"] = hashlib.sha256(gated_plist_bytes(job, ns["python"], ns["script"], ns["store"], str(ns["home"]))).hexdigest()
+    return job
+
+
+def diff_jobs(old: dict | None, new: dict | None) -> list[str]:
+    if old is None:
+        return ["new"]
+    if new is None:
+        return ["removed from the approved list"]
+    ch = [k for k in ("mode", "program", "argv", "cwd", "env", "schedule", "extra_files") if old.get(k) != new.get(k)]
+    of, nf = old.get("files") or {}, new.get("files") or {}
+    for p in sorted(set(of) | set(nf)):
+        if p not in of:
+            ch.append(f"file added: {p}")
+        elif p not in nf:
+            ch.append(f"file dropped: {p}")
+        elif of[p] != nf[p]:
+            ch.append(f"file changed: {p}")
+    if (old.get("extra") or {}).get("sha") != (new.get("extra") or {}).get("sha"):
+        ch.append("approved record changed")
+    if not ch and old.get("plist_sha") != new.get("plist_sha"):
+        ch.append("gated plist")
+    return ch
+
+
+def write_pending_loops(store: Store, pend: Path, jobs: dict, prev_seq: int, now: float | None = None) -> int:
+    last = load_json(store.loops_last_seen)
+    seq = max(int(last.get("seq", 0)), prev_seq) + 1
+    created = datetime.fromtimestamp(now, timezone.utc).isoformat(timespec="microseconds") if now is not None \
+        else datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    manifest = {"kind": "loops", "version": 1, "seq": seq, "created": created, "jobs": dict(sorted(jobs.items()))}
+    pend.mkdir(parents=True, exist_ok=True)
+    (pend / "loops.json").write_bytes(json.dumps(manifest, indent=1, sort_keys=True).encode() + b"\n")
+    sigf = pend / "loops.json.sig"
+    if sigf.exists():
+        sigf.unlink()
+    return seq
+
+
+def cmd_loops_propose(args) -> int:
+    store = Store(args.store)
+    cfg = store.config()
+    home = Path(args.home) if args.home else Path.home()
+    pend = Path(args.pending_dir)
+    la = Path(args.launch_agents) if args.launch_agents else home / "Library" / "LaunchAgents"
+    try:
+        prev_m, _ = load_trusted_manifest(store, "loops")
+    except NoLoops:
+        prev_m = {}
+    except Untrusted as e:
+        print(f"loops propose refused: the current loops manifest is not trusted ({e})", file=sys.stderr)
+        return EXIT_UNTRUSTED
+    prev_jobs = dict(prev_m.get("jobs") or {})
+    try:
+        extra_files = parse_extra_files(args)
+    except (ValueError, OSError) as e:
+        print(f"loops propose: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    src = None
+    if args.extra_json:
+        src = {"json": os.path.abspath(args.extra_json), "list": args.extra_list or "", "id": args.extra_id or "id"}
+    ns = {"home": home, "store": str(store.root), "python": args.python,
+          "script": args.gate_script or str(store.root / "agent_integrity.py"),
+          "extra_files": extra_files, "extra_source": src}
+
+    plists: dict[str, tuple[str, dict, bytes]] = {}
+    warnings: list[str] = []
+    for p in sorted(la.glob("*.plist")) if la.is_dir() else []:
+        parsed = read_plist(p)
+        if not parsed:
+            warnings.append(f"{p.name}: unreadable plist, skipped")
+            continue
+        lab = plist_label(parsed[0], p.stem)
+        if lab in plists:
+            print(f"loops propose: two plists claim label {lab!r}; fix that first", file=sys.stderr)
+            return EXIT_USAGE
+        plists[lab] = (p.name, parsed[0], parsed[1])
+
+    explicit = set(args.label or [])
+    prefixes = tuple(args.prefix or [])
+    if args.all:
+        selected = set(plists)
+    elif explicit:
+        selected = set(explicit)
+    else:
+        selected = set(prev_jobs)
+    if not selected and not prev_jobs:
+        print("loops propose: name jobs with --label L (repeatable) or --all [--prefix P]", file=sys.stderr)
+        return EXIT_USAGE
+
+    new_jobs = {k: v for k, v in prev_jobs.items() if k not in selected and (args.all is False or k in plists)}
+    if args.all:
+        new_jobs = {}
+    removed = []
+    problems: list[str] = []
+    for label in sorted(selected):
+        if label not in plists:
+            if label in prev_jobs:
+                removed.append(label)
+            else:
+                warnings.append(f"{label}: no plist with that Label in {la}")
+            continue
+        name, d, raw = plists[label]
+        mode = "gated"
+        if args.all and label not in explicit and prefixes and not label.startswith(prefixes):
+            mode = "pinned"
+        elif not args.all and not explicit and prev_jobs.get(label, {}).get("mode") == "pinned":
+            mode = "pinned"
+        if mode == "pinned":
+            new_jobs[label] = {"label": label, "plist_name": name, "mode": "pinned",
+                               "plist_sha": hashlib.sha256(raw).hexdigest()}
+            continue
+        try:
+            new_jobs[label] = make_job(label, name, d, raw, prev_jobs.get(label), ns)
+        except (ValueError, OSError, KeyError) as e:
+            problems.append(f"{label}: {e}")
+    if args.all:
+        removed = sorted(k for k in prev_jobs if k not in plists)
+
+    review: dict[str, dict] = {}
+    for label in sorted(set(new_jobs) | set(prev_jobs)):
+        old, new = prev_jobs.get(label), new_jobs.get(label)
+        if label in removed or (new is None and old is not None and label in selected):
+            new = None
+        if new is None and old is not None and label not in removed and label not in selected:
+            continue
+        ch = diff_jobs(old, new)
+        state = "removed" if new is None else ("new" if old is None else ("changed" if ch else "unchanged"))
+        entry = {"state": state, "mode": (new or old or {}).get("mode"), "changes": ch if ch != ["new"] else [],
+                 "argv": (new or {}).get("argv"), "sig_hits": {}}
+        if new and new.get("mode") == "gated":
+            oldf = (old or {}).get("files") or {}
+            for pth, dig in (new.get("files") or {}).items():
+                if oldf.get(pth) != dig and os.path.isfile(pth):
+                    hits = sig_hits(Path(pth), False)
+                    if hits:
+                        entry["sig_hits"][pth] = hits
+            if new.get("notes"):
+                entry["notes"] = new["notes"]
+        review[label] = entry
+    changed = [k for k, v in review.items() if v["state"] != "unchanged"]
+    for k in removed:
+        new_jobs.pop(k, None)
+
+    if args.json:
+        print(json.dumps({"tool": "agent-integrity", "version": VERSION, "command": "loops propose",
+                          "jobs": review, "problems": problems, "warnings": warnings}, indent=1, sort_keys=True))
+    counts = {s: sum(1 for v in review.values() if v["state"] == s) for s in ("new", "changed", "removed", "unchanged")}
+    if not args.json:
+        for w in warnings:
+            print(f"  warning: {w}")
+        for pr in problems:
+            print(f"  cannot propose {pr}")
+        print(f"loops propose: {counts['new']} new, {counts['changed']} changed, {counts['removed']} removed, "
+              f"{counts['unchanged']} unchanged")
+        for label in changed:
+            v = review[label]
+            print(f"  {v['state'].upper():8} {label}  [{v['mode']}]")
+            if v["argv"]:
+                print(f"           runs: {clean_text(' '.join(v['argv']), 200)}")
+            for c in v["changes"][:8]:
+                print(f"           {clean_text(c, 200)}")
+            if len(v["changes"]) > 8:
+                print(f"           ...+{len(v['changes']) - 8} more")
+            for pth, hits in v["sig_hits"].items():
+                print(f"           ! {pth} matches: {', '.join(hits)}")
+            for n in v.get("notes", [])[:3]:
+                print(f"           note: {clean_text(n, 200)}")
+    if problems:
+        return EXIT_USAGE
+    if not changed:
+        if not args.json:
+            print("nothing to approve.")
+        return EXIT_CLEAN
+    seq = write_pending_loops(store, pend, new_jobs, int(prev_m.get("seq", 0)), getattr(args, "now", None))
+    stage = pend / "staged-plists"
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    for label, job in new_jobs.items():
+        if job.get("mode") == "gated":
+            (stage / job["plist_name"]).write_bytes(
+                gated_plist_bytes(job, ns["python"], ns["script"], ns["store"], str(home)))
+    if not args.json:
+        print(f"-> PENDING {pend / 'loops.json'} (seq {seq}); not trusted until signed.")
+        print(f"Next: python3 {SELF.name} loops sign --key <your private key>")
+    return EXIT_CLEAN
+
+
+def record_loops_sign(store: Store, args, pend: Path, prev: dict) -> None:
+    now = getattr(args, "now", None)
+    now = now if now is not None else time.time()
+    try:
+        raw = store.loops.read_bytes()
+        m = json.loads(raw)
+        loc = store.root if is_protected(store) else Path(getattr(args, "user_dir", None) or pend)
+        pj, nj = prev.get("jobs", {}), m["jobs"]
+        added = sorted(k for k in nj if k not in pj)
+        removed = sorted(k for k in pj if k not in nj)
+        changed = sorted(k for k in nj if k in pj and nj[k] != pj[k])
+        tr = Trail(loc / "events.jsonl")
+        ok, _n, why = tr.verify()
+        if not ok:
+            print(f"agent-integrity: loops sign event not recorded, audit trail broken: {why}", file=sys.stderr)
+            return
+        tr.append("loops-sign", "loops", now, new_digest="sha256:" + hashlib.sha256(raw).hexdigest()[:16],
+                  semantic_lines=[f"you approved loops seq {m['seq']}: {len(added)} new, {len(changed)} changed, "
+                                  f"{len(removed)} removed"],
+                  extra={"loops_seq": m["seq"], "added": added[:200], "changed": changed[:200], "removed": removed[:200]})
+    except (OSError, ValueError, KeyError) as e:
+        print(f"agent-integrity: loops sign event not recorded: {e}", file=sys.stderr)
+
+
+def promote_loops(args) -> int:
+    store = Store(args.store)
+    pend = Path(args.pending_dir)
+    prev = load_json(store.loops)
+    try:
+        install_signed(store, pend / "loops.json", pend / "loops.json.sig", kind="loops")
+    except Untrusted as e:
+        print(f"promote refused: {e}", file=sys.stderr)
+        return EXIT_UNTRUSTED
+    except PermissionError:
+        print(f"promote needs write access to {store.root} (root-owned). Run:\n"
+              f"  sudo python3 {SELF} promote --loops --store '{store.root}' --pending-dir '{pend}'", file=sys.stderr)
+        return EXIT_USAGE
+    print(f"promoted signed loops manifest into {store.root}")
+    record_loops_sign(store, args, pend, prev)
+    return EXIT_CLEAN
+
+
+def run_launchctl(*a: str) -> tuple[int, str]:
+    try:
+        r = subprocess.run([launchctl_bin(), *a], capture_output=True, text=True, timeout=30)
+        return r.returncode, (r.stderr or r.stdout).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+def cmd_loops_apply(args) -> int:
+    store = Store(args.store)
+    home = Path(args.home) if args.home else Path.home()
+    cfg = store.config()
+    user = user_dir_of(args, cfg)
+    la = Path(args.launch_agents) if args.launch_agents else home / "Library" / "LaunchAgents"
+    pend = Path(args.pending_dir)
+    stage = Path(args.stage_dir) if args.stage_dir else pend / "staged-plists"
+    try:
+        m, _ = load_trusted_manifest(store, "loops")
+    except NoLoops as e:
+        print(f"loops apply: {e}; run loops propose, sign and promote first", file=sys.stderr)
+        return EXIT_USAGE
+    except Untrusted as e:
+        print(f"loops apply refused: {e}", file=sys.stderr)
+        return EXIT_UNTRUSTED
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    bdir = user / "plist-backups" / stamp
+    uid = os.getuid()
+    failed = 0
+    la.mkdir(parents=True, exist_ok=True)
+    labels = args.label or sorted(m["jobs"])
+    for label in labels:
+        job = m["jobs"].get(label)
+        if not job:
+            print(f"  {label}: not in the approved list")
+            failed += 1
+            continue
+        if job.get("mode") != "gated":
+            continue
+        dest = la / job["plist_name"]
+        if dest.is_file() and sha_file(dest) == job["plist_sha"]:
+            print(f"  {label}: already gated")
+            continue
+        src = stage / job["plist_name"]
+        if not src.is_file() or sha_file(src) != job["plist_sha"]:
+            print(f"  {label}: no staged plist matches the approval; run loops propose again")
+            failed += 1
+            continue
+        if dest.exists():
+            bdir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dest, bdir / job["plist_name"])
+            idx = load_json(bdir / "index.json")
+            idx[label] = job["plist_name"]
+            atomic_write(bdir / "index.json", json.dumps(idx, indent=1))
+        tmp = dest.with_name(dest.name + ".tmp")
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dest)
+        run_launchctl("bootout", f"gui/{uid}/{label}")
+        rc, why = run_launchctl("bootstrap", f"gui/{uid}", str(dest))
+        if rc != 0:
+            print(f"  {label}: gated plist installed but launchctl bootstrap failed ({why})")
+            failed += 1
+        else:
+            print(f"  {label}: gated and reloaded")
+    return EXIT_DRIFT if failed else EXIT_CLEAN
+
+
+def cmd_loops_unadopt(args) -> int:
+    store = Store(args.store)
+    home = Path(args.home) if args.home else Path.home()
+    user = user_dir_of(args, store.config())
+    la = Path(args.launch_agents) if args.launch_agents else home / "Library" / "LaunchAgents"
+    pend = Path(args.pending_dir)
+    try:
+        m, _ = load_trusted_manifest(store, "loops")
+    except Untrusted as e:
+        print(f"loops unadopt refused: {e}", file=sys.stderr)
+        return EXIT_UNTRUSTED
+    job = m["jobs"].get(args.label)
+    if not job:
+        print(f"{args.label} is not in the approved list", file=sys.stderr)
+        return EXIT_USAGE
+    name = job["plist_name"]
+    backup = None
+    root = user / "plist-backups"
+    for d in sorted(root.iterdir(), reverse=True) if root.is_dir() else []:
+        cand = d / name
+        parsed = read_plist(cand) if cand.is_file() else None
+        if parsed and not gate_label_of(parsed[0]):
+            backup = cand
+            break
+    if backup is None:
+        print(f"no ungated backup of {name} under {root}", file=sys.stderr)
+        return EXIT_USAGE
+    uid = os.getuid()
+    dest = la / name
+    tmp = dest.with_name(dest.name + ".tmp")
+    shutil.copyfile(backup, tmp)
+    os.replace(tmp, dest)
+    run_launchctl("bootout", f"gui/{uid}/{args.label}")
+    rc, why = run_launchctl("bootstrap", f"gui/{uid}", str(dest))
+    print(f"restored {backup} -> {dest}" + ("" if rc == 0 else f" (launchctl bootstrap failed: {why})"))
+    jobs = {k: v for k, v in m["jobs"].items() if k != args.label}
+    seq = write_pending_loops(store, pend, jobs, int(m.get("seq", 0)), getattr(args, "now", None))
+    print(f"Wrote PENDING {pend / 'loops.json'} (seq {seq}) without {args.label}. Until you sign it the restored "
+          f"plist reads as unapproved. Next: python3 {SELF.name} loops sign --key <your private key>")
+    return EXIT_CLEAN
+
+
+def loops_status_doc(store: Store, home: Path, user: Path, la: Path) -> tuple[dict, int]:
+    cfg = store.config()
+    doc: dict = {"tool": "agent-integrity", "version": VERSION, "command": "loops status",
+                 "manifest": {"present": store.loops.is_file(), "trusted": False, "seq": None, "reason": ""},
+                 "labels": {}, "counts": {}, "refused": {}}
+    for d in refusal_tail(user):
+        doc["refused"][d["label"]] = {"ts": d.get("ts"), "iso": d.get("iso"), "reasons": d.get("reasons", [])[:5]}
+    try:
+        m, _ = load_trusted_manifest(store, "loops")
+    except NoLoops as e:
+        doc["manifest"]["reason"] = str(e)
+        return doc, EXIT_USAGE
+    except Untrusted as e:
+        doc["manifest"]["reason"] = str(e)
+        return doc, EXIT_UNTRUSTED
+    doc["manifest"].update(trusted=True, seq=int(m["seq"]))
+    states = loops_states(m["jobs"], home, la, forbid_dirs_of(cfg, home))
+    for label, st in states.items():
+        doc["labels"][label] = {"state": st["state"], "mode": st["mode"], "plist": st["plist"], "changes": st["changes"]}
+        doc["counts"][st["state"]] = doc["counts"].get(st["state"], 0) + 1
+    bad = any(v["state"] != "approved" for v in doc["labels"].values())
+    return doc, EXIT_DRIFT if bad else EXIT_CLEAN
+
+
+def cmd_loops_status(args) -> int:
+    store = Store(args.store)
+    home = Path(args.home) if args.home else Path.home()
+    user = user_dir_of(args, store.config())
+    la = Path(args.launch_agents) if args.launch_agents else home / "Library" / "LaunchAgents"
+    doc, rc = loops_status_doc(store, home, user, la)
+    if args.json:
+        print(json.dumps(doc, indent=1, sort_keys=True))
+        return rc
+    mf = doc["manifest"]
+    if not mf["trusted"]:
+        print(f"loops: {mf['reason'] or 'manifest not trusted'}")
+        return rc
+    tally = ", ".join(f"{n} {s}" for s, n in sorted(doc["counts"].items())) or "no jobs"
+    print(f"loops (manifest seq {mf['seq']}): {tally}")
+    for label, v in sorted(doc["labels"].items()):
+        if v["state"] != "approved":
+            print(f"  {v['state'].upper():10} {label}")
+            for c in v["changes"][:4]:
+                print(f"             {clean_text(c, 200)}")
+    return rc
+
+
+# --- root watcher: the loops section of `check` ---------------------------------------------
+def loops_findings(store: Store, home: Path, cfg: dict, res: "Result") -> list[dict]:
+    """Opt-in by the existence of a signed loops manifest. Read-only: acting on a finding is
+    enforce_loops, which only the root daemon run does."""
+    if not store.loops.is_file():
+        return []
+    try:
+        m, _ = load_trusted_manifest(store, "loops")
+    except Untrusted as e:
+        res.notes.append(f"loops manifest not trusted: {e}")
+        return [{"label": "(loops manifest)", "state": "untrusted", "changes": [str(e)], "enforce": False,
+                 "action": None, "boot_label": None}]
+    la = home / "Library" / "LaunchAgents"
+    out = []
+    for label, st in sorted(loops_states(m["jobs"], home, la, forbid_dirs_of(cfg, home)).items()):
+        if st["state"] == "approved":
+            continue
+        plist_level = any(p["kind"] == "plist" for p in st["problems"])
+        out.append({"label": label, "state": st["state"], "changes": st["changes"][:5], "action": None,
+                    "enforce": st["state"] in ("changed", "unapproved") and plist_level,
+                    "boot_label": st["boot_label"]})
+    return out
+
+
+def enforce_loops(res: "Result", home) -> None:
+    """Root only: boot out jobs whose plist is not the approved one. Never rewrites or deletes a
+    file, so the evidence stays where it is."""
+    try:
+        uid = os.stat(home).st_uid
+    except OSError as e:
+        res.notes.append(f"loops enforcement skipped: cannot stat {home}: {e}")
+        return
+    done = 0
+    for f in res.loops:
+        if not f.get("enforce") or not f.get("boot_label"):
+            continue
+        rc, why = run_launchctl("bootout", f"gui/{uid}/{f['boot_label']}")
+        if rc == 0:
+            f["action"] = "booted-out"
+            done += 1
+        elif rc in (3, 113):
+            f["action"] = "not-loaded"
+        else:
+            f["action"] = f"bootout-failed rc={rc}"
+    if done:
+        res.notes.append(f"loops enforcement: booted out {done} job(s) whose plist is not the approved one")
+
+
+def record_loops(res: "Result", tr: Trail, now: float) -> int:
+    last: dict[str, dict] = {}
+    for e in tr.events():
+        if e["kind"] in ("loops-drift", "loops-bootout"):
+            last[e["kind"] + "|" + e["key"]] = e
+    n = 0
+    for f in res.loops:
+        dig = "sha256:" + hashlib.sha256(canonical_json([f["state"], f["changes"]]).encode()).hexdigest()[:16]
+        lines = [clean_text(f"{f['state']}: " + "; ".join(f["changes"][:3]))]
+        if f.get("action") == "booted-out":
+            k = "loops-bootout|" + f["label"]
+            if not last.get(k) or last[k]["new_digest"] != dig:
+                last[k] = tr.append("loops-bootout", f["label"], now, new_digest=dig, risk="raising",
+                                    semantic_lines=lines + ["booted out by the root check (loops_enforce)"])
+                n += 1
+        k = "loops-drift|" + f["label"]
+        if not last.get(k) or last[k]["new_digest"] != dig:
+            last[k] = tr.append("loops-drift", f["label"], now, new_digest=dig,
+                                risk="raising" if f["state"] in ("changed", "unapproved", "untrusted") else "review-soon",
+                                semantic_lines=lines)
+            n += 1
+    return n
+
+
+def loop_lines(loops: list[dict], cap: int = 4) -> list[str]:
+    out = []
+    for f in loops[:cap]:
+        tail = f" -> {f['action']}" if f.get("action") else ""
+        first = clean_text(f["changes"][0], 120) if f.get("changes") else ""
+        out.append(f"  loop {clean_text(f['label'], 80)}: {f['state']}{(' (' + first + ')') if first else ''}{tail}")
+    if len(loops) > cap:
+        out.append(f"  ... +{len(loops) - cap} more scheduled job(s); use --format json")
+    return out
+
+
+def add_loops_parsers(sub) -> None:
+    def base(s, pend=True):
+        s.add_argument("--store", default=str(default_store()))
+        s.add_argument("--home", help="home dir whose LaunchAgents are managed (default: current user's)")
+        s.add_argument("--user-dir", help="per-user state dir (default: <home>/.agent-integrity)")
+        s.add_argument("--launch-agents", help="LaunchAgents dir (default: <home>/Library/LaunchAgents)")
+        s.add_argument("--now", type=float, help=argparse.SUPPRESS)
+        if pend:
+            s.add_argument("--pending-dir", default=str(default_pending_dir()))
+
+    s = sub.add_parser("run-loop", help="the gate: run an approved scheduled job, or refuse (exit 3)")
+    s.add_argument("label")
+    s.add_argument("--store", default=str(default_store()))
+    s.add_argument("--home", help="home dir of the job's user (the gated plist always passes it)")
+    s.add_argument("--user-dir", help=argparse.SUPPRESS)
+    s.add_argument("--now", type=float, help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_run_loop)
+
+    lp = sub.add_parser("loops", help="approved scheduled jobs: propose, sign, apply, unadopt, status")
+    ls = lp.add_subparsers(dest="loops_cmd", required=True)
+    s = ls.add_parser("propose", help="build a pending loops manifest and staged gated plists (no sudo)")
+    base(s)
+    s.add_argument("--label", action="append", help="job label to approve (repeatable)")
+    s.add_argument("--all", action="store_true", help="every plist in LaunchAgents; non-prefix ones become pinned")
+    s.add_argument("--prefix", action="append", help="with --all: labels starting with this are gated, the rest pinned")
+    s.add_argument("--python", default="/usr/bin/python3", help="interpreter the gated plists use")
+    s.add_argument("--gate-script", help="gate script path (default: <store>/agent_integrity.py)")
+    s.add_argument("--extra-files", action="append", metavar="LABEL=PATH[,LABEL=PATH]",
+                   help="also pin this file for that job (repeatable)")
+    s.add_argument("--extra-files-json", metavar="FILE", help="JSON {label: [paths]} of extra files to pin")
+    s.add_argument("--extra-json", metavar="FILE", help="pin, per job, the canonical JSON of its entry in this file")
+    s.add_argument("--extra-list", help="key holding the list of entries inside --extra-json (default: top level)")
+    s.add_argument("--extra-id", help="field that equals the job label (default: id)")
+    s.add_argument("--json", action="store_true", help="machine-readable review")
+    s.set_defaults(fn=cmd_loops_propose)
+    s = ls.add_parser("sign", help="sign the pending loops manifest (passphrase prompt), then promote")
+    s.add_argument("--store", default=str(default_store()))
+    s.add_argument("--pending-dir", default=str(default_pending_dir()))
+    s.add_argument("--user-dir", help="where an unprotected store keeps its audit trail (default: the pending dir)")
+    s.add_argument("--now", type=float, help=argparse.SUPPRESS)
+    s.add_argument("--key", required=True, help="your private key (passphrase-protected)")
+    s.add_argument("--sign-only", action="store_true", help="stop after signing; promote separately with sudo")
+    s.set_defaults(fn=cmd_sign, loops=True)
+    s = ls.add_parser("apply", help="install the staged gated plists and reload them (after promote)")
+    base(s)
+    s.add_argument("--label", action="append")
+    s.add_argument("--stage-dir", help="staged plists (default: <pending-dir>/staged-plists)")
+    s.set_defaults(fn=cmd_loops_apply)
+    s = ls.add_parser("unadopt", help="restore a job's original plist and stage its removal")
+    base(s)
+    s.add_argument("label")
+    s.set_defaults(fn=cmd_loops_unadopt)
+    s = ls.add_parser("status", help="per job: approved, changed, unapproved, not-gated, missing")
+    base(s, pend=False)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_loops_status)
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="agent-integrity", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3234,9 +4375,11 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--pending-dir", default=str(default_pending_dir()))
         s.add_argument("--user-dir", help="where an unprotected store keeps its audit trail (default: the pending dir)")
         s.add_argument("--now", type=float, help=argparse.SUPPRESS)
+        s.add_argument("--loops", action="store_true", help="install loops.json (approved scheduled jobs) instead of manifest.json")
         if name == "sign":
             s.add_argument("--key", required=True, help="your private key (passphrase-protected)")
         s.set_defaults(fn=fn)
+    add_loops_parsers(sub)
     return ap
 
 
