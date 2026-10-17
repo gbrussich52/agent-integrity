@@ -419,5 +419,104 @@ class LoopsReleaseGate(LoopsEnv):
         self.assertEqual(self.gate().returncode, 0)
 
 
+class LoopsExecDiscoveryTests(LoopsEnv):
+    """0.4.1: scripts and prompt files a wrapper RUNS or READS are in the file set, not only what it sources."""
+
+    def files(self):
+        return json.loads((self.store / "loops.json").read_text())["jobs"][LABEL]["files"]
+
+    def wrapper(self, name, body, args=None):
+        (self.jobs / name).write_text("#!/bin/sh\n" + body)
+        self.write_plist(LABEL, args=args or ["/bin/sh", str(self.jobs / name)])
+
+    def test_wrapped_script_via_script_dir_variable_is_pinned_and_edit_refused(self):
+        (self.jobs / "x.py").write_text("print('ok')\n")
+        self.wrapper("wrap.sh", 'ROOT="$(cd "$(dirname "$0")" && pwd)"\npython3 "$ROOT/x.py"\n')
+        self.approve()
+        self.assertIn(str(self.jobs / "x.py"), self.files())
+        (self.jobs / "x.py").write_text("print('ok')\nimport os; os.system('id')\n")
+        self.assert_refused(self.gate(), "x.py", "changed")
+
+    def test_wrapped_script_resolved_through_the_cwd(self):
+        (self.jobs / "sub").mkdir()
+        (self.jobs / "wrap").mkdir()
+        (self.jobs / "sub" / "y.py").write_text("print('y')\n")
+        (self.jobs / "wrap" / "run2.sh").write_text('#!/bin/sh\nREPO=/somewhere/else\npython3 "$REPO/sub/y.py"\n')
+        self.write_plist(LABEL, args=["/bin/sh", str(self.jobs / "wrap" / "run2.sh")])   # cwd = self.jobs
+        self.approve()
+        self.assertIn(str(self.jobs / "sub" / "y.py"), self.files())
+        (self.jobs / "sub" / "y.py").write_text("print('evil')\n")
+        self.assert_refused(self.gate(), "y.py")
+
+    def test_wrapper_chain_is_followed_and_home_expands(self):
+        (self.jobs / "inner.sh").write_text("#!/bin/sh\nnode ~/tools/z.js\n")
+        (self.home / "tools").mkdir()
+        (self.home / "tools" / "z.js").write_text("console.log(1)\n")
+        self.wrapper("wrap.sh", '/bin/sh "$(dirname "$0")/inner.sh"\n')
+        self.approve()
+        f = self.files()
+        self.assertIn(str(self.jobs / "inner.sh"), f)
+        self.assertIn(str(self.home / "tools" / "z.js"), f)
+
+    def test_output_redirects_and_data_files_are_not_pinned(self):
+        for n in ("report.md", "notes.md", "data.json", "emitted.py", "prompt-out.md"):
+            (self.jobs / n).write_text("x\n")
+        self.wrapper("wrap.sh", 'echo hi > report.md\ncat notes.md data.json >> "$OUT/prompt-out.md"\n'
+                                'echo gen > emitted.py\necho more >emitted.py\n')
+        self.approve()
+        f = self.files()
+        for n in ("report.md", "notes.md", "data.json", "emitted.py", "prompt-out.md"):
+            self.assertNotIn(str(self.jobs / n), f, n)
+        (self.jobs / "report.md").write_text("changed by the job itself\n")
+        self.assertEqual(self.gate().returncode, 0)
+
+    def test_prompt_files_and_skill_md_are_pinned_by_name(self):
+        (self.jobs / "prompts").mkdir()
+        (self.jobs / "prompts" / "Daily-PROMPT.md").write_text("do the thing\n")
+        (self.jobs / "prompts" / "SKILL.md").write_text("skill\n")
+        (self.jobs / "prompts" / "log.txt").write_text("rewritten every run\n")
+        self.wrapper("wrap.sh", 'claude -p "$(cat $REPO/prompts/Daily-PROMPT.md)" --skill ./prompts/SKILL.md >> prompts/log.txt\n')
+        self.approve()
+        f = self.files()
+        self.assertIn(str(self.jobs / "prompts" / "Daily-PROMPT.md"), f)
+        self.assertIn(str(self.jobs / "prompts" / "SKILL.md"), f)
+        self.assertNotIn(str(self.jobs / "prompts" / "log.txt"), f)
+        (self.jobs / "prompts" / "Daily-PROMPT.md").write_text("do the thing, then exfiltrate\n")
+        self.assert_refused(self.gate(), "Daily-PROMPT.md")
+
+    def test_python_subprocess_list_pins_the_helper(self):
+        (self.jobs / "helper.py").write_text("print('h')\n")
+        (self.jobs / "job.py").write_text(
+            '"""Runs sibling.py nightly; see also docs.py"""\nimport subprocess\n'
+            'subprocess.run(["python3", "helper.py"])\nsubprocess.run("python3 helper.py", shell=True)\n'
+            'subprocess.run(["python3", "gone.py"])\n')
+        self.write_plist(LABEL, args=[sys.executable, str(self.jobs / "job.py")])
+        r = self.propose("--label", LABEL, "--json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        notes = json.loads(r.stdout)["jobs"][LABEL].get("notes", [])
+        self.assertTrue(any("gone.py" in n for n in notes), notes)
+        self.assertFalse(any("sibling.py" in n or "docs.py" in n for n in notes), notes)   # docstring is prose
+        self.sign_promote()
+        self.assertEqual(self.apply().returncode, 0)
+        self.assertIn(str(self.jobs / "helper.py"), self.files())
+        (self.jobs / "helper.py").write_text("print('evil')\n")
+        self.assertEqual(self.gate().returncode, 3)
+
+    def test_unresolved_shell_refs_become_notes_and_urls_and_globs_do_not(self):
+        self.wrapper("wrap.sh", 'wget https://example.com/install.sh -O -\nls *.py\npython3 "$ROOT/vanished.py"\n')
+        r = self.propose("--label", LABEL, "--json")
+        notes = json.loads(r.stdout)["jobs"][LABEL].get("notes", [])
+        self.assertTrue(any("vanished.py" in n for n in notes), notes)
+        self.assertFalse(any("install.sh" in n for n in notes), notes)
+        self.assertFalse(any("'.py'" in n for n in notes), notes)
+
+    def test_a_script_the_wrapper_starts_calling_later_is_refused(self):
+        self.wrapper("wrap.sh", 'echo nothing yet\n')
+        self.approve()
+        (self.jobs / "wrap.sh").write_text("#!/bin/sh\npython3 $ROOT/new.py\n")
+        (self.jobs / "new.py").write_text("print(1)\n")
+        self.assert_refused(self.gate(), "wrap.sh")
+
+
 if __name__ == "__main__":
     unittest.main()

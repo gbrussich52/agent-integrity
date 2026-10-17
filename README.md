@@ -156,8 +156,11 @@ python3 agent_integrity.py loops status                           # approved / c
   list, re-hashes the plist and the job's file set, and then runs the **approved** argv, cwd and env, never
   anything read from the plist or the caller's environment. If anything differs, it exits 3, writes
   `loops-refused.jsonl`, calls `loops_notify_cmd` if you set one, and does not run the job.
-- The file set is: argv files, `PROMPT.md`/`prompt.md` beside the program, shell `source` / `.` targets
-  and python imports (depth 5), and anything you pin with `--extra-files label=path,...`
+- The file set is: argv files, `PROMPT.md`/`prompt.md` beside the program, shell `source` / `.` targets,
+  any script a shell line names (a word ending `.py .sh .bash .zsh .js .mjs .cjs .ts .rb .pl`, with or
+  without a variable prefix such as `"$ROOT/x.py"`), prompt files (`.md`/`.txt` with "prompt" in the
+  name, or `SKILL.md`), python imports and python string constants naming such files (depth 5), and
+  anything you pin with `--extra-files label=path,...`
   (or `--extra-files-json`). `--extra-json FILE --extra-list KEY --extra-id FIELD` pins, per job, the
   canonical JSON of its entry in a file you keep, as a sha256 only.
 - With a signed loops manifest, `check` also reports plists that are not in it or differ from it. Set
@@ -169,7 +172,8 @@ python3 agent_integrity.py loops status                           # approved / c
 Limits, said plainly. Shell and python discovery is static: a script that builds the path of a file
 from data at run time (`source "$X/lib.sh"` with `X` set elsewhere, `importlib`, `exec`, `eval`) can
 load a file the tool cannot see; `propose` prints a note when it cannot resolve a path, and you can pin
-the file by hand. Interpreters and binaries under OS-protected folders (`/usr/bin`, `/bin`, `/System`)
+the file by hand. Other `.md`/`.json`/data files are deliberately not pinned (loops rewrite them), and
+output redirect targets are skipped. Interpreters and binaries under OS-protected folders (`/usr/bin`, `/bin`, `/System`)
 are not hashed; others, such as a Homebrew python, are. A program that reads a data file you did not
 list (a config, a queue) is only as safe as that file. The gate protects the job's definition, not the
 data it works on.

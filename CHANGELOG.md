@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+
+### What changed
+- **The loop file set now follows scripts a wrapper executes**, not only argv files, sourced helpers and
+  imports. Prior code only pinned `source X` targets, so a wrapper that ran `python3 "$ROOT/x.py"` could
+  have `x.py` edited without the gate noticing. Why: director review of 0.4.0 found this blocking gap.
+  - Shell: every word in a non-comment line whose literal tail ends in a code extension (`.py .sh .bash
+    .zsh .js .mjs .cjs .ts .rb .pl`) is resolved like a variable-prefixed path (the tail after the last
+    `$` or backtick segment, tried against the script dir and the cwd; `~`/`$HOME` expand). No `source`
+    needed; recursive under the same depth cap.
+  - Prompt files: `.md`/`.txt` tokens whose basename contains "prompt" (any case), and `SKILL.md`, are
+    pinned the same way (e.g. `claude -p "$(cat .../PROMPT.md)"`). Other `.md`/`.json`/data files are
+    never pinned, because loops rewrite them and the job would be refused forever. Output redirect
+    targets (`> report.md`), URLs and globs are skipped.
+  - Python: string constants (not docstrings or f-string pieces) that name a code file or prompt file and
+    resolve to an existing file under the script dir or cwd are pinned, which covers
+    `subprocess.run(["python3", "helper.py"])`.
+  - A candidate that does not resolve becomes a `propose` note, as before.
+- Tests: `LoopsExecDiscoveryTests` in `tests/test_loops.py` (8 tests, six fail on 0.4.0).
+
 ## 0.4.0 (unreleased)
 
 ### What changed

@@ -49,6 +49,10 @@ record the pass rate in `bench/HISTORY.md`; it must be at least 90%.
 8. the gate never runs argv taken from an edited plist or the caller's environment; the approved argv,
    cwd and env run;
 9. an extra-blob mismatch (a registry entry edited) is refused, while an edit to another entry is not.
+0.4.1 adds `LoopsExecDiscoveryTests` (8 tests): a script a wrapper runs through a script-dir variable or
+the cwd, a followed wrapper chain, prompt files and `SKILL.md` by name, a python subprocess helper, a
+script the wrapper starts calling later (refused), and the negatives (`> report.md`, data files, URLs,
+globs are not pinned; unresolved candidates become notes).
 `tests/test_hook_and_install.py` also installs into a store path containing a space, parses the daemon
 plist with `plistlib` and asserts `--store` is one element.
 

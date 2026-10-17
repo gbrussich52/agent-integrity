@@ -65,7 +65,7 @@ try:                       # advisory file locking for the audit log; absent on 
 except ImportError:        # pragma: no cover
     fcntl = None
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 NAMESPACE = "agent-integrity"   # ssh-keygen -Y namespace: a signature made for another purpose won't verify
 PRINCIPAL = "agent-integrity"
 SELF = Path(__file__).resolve()
@@ -3352,42 +3352,92 @@ def first_shell_word(rest: str) -> str:
 
 
 SOURCE_RX = re.compile(r"(?:^|[;&|({]|\bthen\b|\bdo\b|\belse\b)\s*(?:source|\.)\s+(\S.*)$")
+CODE_EXTS = (".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl")
+DOC_EXTS = (".md", ".txt")
+# A word that ends in a code or prompt extension. `:` is allowed so a URL can be recognised and dropped.
+EXEC_TOKEN_RX = re.compile(r"[\w$~{}./@+:-]*\.(?:py|sh|bash|zsh|js|mjs|cjs|ts|rb|pl|md|txt)(?![\w.$/-])", re.I)
+MAX_PY_STRING = 400
+
+
+def pin_worthy(name: str) -> bool:
+    """Code files, and the prompt files a job feeds a model. Never other .md/.txt/.json/data files:
+    loops rewrite those on every run and pinning them would make the job refuse forever."""
+    base = os.path.basename(name)
+    low = base.lower()
+    if not os.path.splitext(base)[0] or not os.path.splitext(base)[1]:
+        return False
+    if low.endswith(CODE_EXTS):
+        return True
+    if low.endswith(DOC_EXTS):
+        return "prompt" in low or low == "skill.md"
+    return False
+
+
+def expand_ref(raw: str, base_dir: str, cwd: str, home: str, dyn: bool = False) -> list[str]:
+    """Candidate paths for a shell word. A path built from a variable or a command substitution is
+    matched by its literal tail (after the last `$`/backtick segment) against the script dir and the cwd."""
+    s = CD_PWD_RX.sub(base_dir, raw)
+    for pat in SCRIPT_DIR_EXPRS:
+        s = s.replace(pat, base_dir)
+    s = re.sub(r"\$\{HOME\}|\$HOME(?![\w])", lambda _m: home, s)
+    if s.startswith("~/"):
+        s = home + s[1:]
+    if dyn or "$" in s or "`" in s:
+        parts = s.split("/")
+        idx = [k for k, x in enumerate(parts) if "$" in x or "`" in x]
+        i = max(idx) if idx else 0
+        tail = "/".join(parts[i + 1:])
+        return [os.path.join(base_dir, tail), os.path.join(cwd, tail)] if tail else []
+    if os.path.isabs(s):
+        return [s]
+    return [os.path.join(base_dir, s), os.path.join(cwd, s)]
+
+
+def is_output_redirect(pre: str) -> bool:
+    """True when the word that ends `pre` + the token is the target of `>`, `>>`, `2>`, `&>`."""
+    cut = max((pre.rfind(c) for c in " \t;|&("), default=-1) + 1
+    return bool(pre[:cut].rstrip().endswith(">") or re.match(r"\d*&?>>?", pre[cut:]))
+
+
+def shell_exec_refs(line: str, skip: str, base_dir: str, cwd: str, home: str,
+                    notes: list[str], where: str) -> list[str]:
+    """Scripts and prompt files a shell line runs or reads: every word that ends in a code extension, and
+    .md/.txt words named like a prompt. Output redirections, URLs and globs are not references."""
+    found: list[str] = []
+    for m in EXEC_TOKEN_RX.finditer(line):
+        tok, pre = m.group(0), line[:m.start()]
+        if tok == skip or "://" in tok or not pin_worthy(tok) or (pre and pre[-1] in "*?["):
+            continue
+        if is_output_redirect(pre):
+            continue
+        dyn = bool(tok.startswith("/") and pre and (pre[-1] in ")`" or (
+            pre[-1] in "\"'" and len(pre) > 1 and (pre[-2].isalnum() or pre[-2] in "_}"))))
+        hit = [c for c in expand_ref(tok, base_dir, cwd, home, dyn) if os.path.isfile(c)]
+        if hit:
+            found.extend(hit)
+        else:
+            notes.append(f"unresolved script ref {tok!r} in {where}")
+    return found
 
 
 def shell_refs(text: str, base_dir: str, cwd: str, home: str, notes: list[str], where: str) -> list[str]:
-    """Literal `source X` / `. X` targets. A path built from a variable is matched by its literal
-    tail against the script dir and the cwd; anything still unresolved is noted, never silently lost."""
+    """Files a shell script pulls in: `source X` / `. X` targets, plus every script or prompt file a line
+    runs or reads (`python3 "$ROOT/x.py"`). Anything unresolved is noted, never silently lost."""
     found: list[str] = []
     for line in text.splitlines():
         if line.lstrip().startswith("#"):
             continue
+        raw = ""
         m = SOURCE_RX.search(line)
-        if not m:
-            continue
-        raw = first_shell_word(m.group(1))
-        if not raw:
-            continue
-        s = CD_PWD_RX.sub(base_dir, raw)
-        for pat in SCRIPT_DIR_EXPRS:
-            s = s.replace(pat, base_dir)
-        s = s.replace("${HOME}", home).replace("$HOME", home)
-        if s.startswith("~/"):
-            s = home + s[1:]
-        cands: list[str]
-        if "$" in s or "`" in s:
-            parts = s.split("/")
-            i = max(k for k, x in enumerate(parts) if "$" in x or "`" in x)
-            tail = "/".join(parts[i + 1:])
-            cands = [os.path.join(base_dir, tail), os.path.join(cwd, tail)] if tail else []
-        elif os.path.isabs(s):
-            cands = [s]
-        else:
-            cands = [os.path.join(base_dir, s), os.path.join(cwd, s)]
-        hit = [c for c in cands if os.path.isfile(c)]
-        if hit:
-            found.extend(hit)
-        else:
-            notes.append(f"unresolved source {raw!r} in {where}")
+        if m:
+            raw = first_shell_word(m.group(1))
+        if raw:
+            hit = [c for c in expand_ref(raw, base_dir, cwd, home) if os.path.isfile(c)]
+            if hit:
+                found.extend(hit)
+            else:
+                notes.append(f"unresolved source {raw!r} in {where}")
+        found.extend(shell_exec_refs(line, raw, base_dir, cwd, home, notes, where))
     return found
 
 
@@ -3403,15 +3453,47 @@ def module_files(mod: str, roots: list[str]) -> list[str]:
     return out
 
 
-def py_refs(text: str, path: str, roots: list[str], notes: list[str]) -> list[str]:
+def py_script_refs(tree: ast.AST, path: str, roots: list[str], home: str, notes: list[str]) -> list[str]:
+    """Scripts and prompt files named by string constants (`subprocess.run(["python3", "helper.py"])`).
+    Docstrings, f-string fragments and strings with globs, URLs or spaces mid-way are not references."""
+    skip: set[int] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Expr):
+            skip.add(id(n.value))
+        elif isinstance(n, ast.JoinedStr):
+            skip.update(id(v) for v in n.values)
+    base_dirs = [r for r in dict.fromkeys(roots + [os.path.dirname(path)]) if r]
+    out: list[str] = []
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Constant) and isinstance(n.value, str)) or id(n) in skip:
+            continue
+        words = n.value.strip().split()
+        if not words or len(n.value) > MAX_PY_STRING:
+            continue
+        w = words[-1].strip("\"'")        # "python3 helper.py" run through a shell: the last word is the file
+        if "://" in w or any(c in w for c in "*?<>|") or not pin_worthy(w):
+            continue
+        w = re.sub(r"\$\{HOME\}|\$HOME(?![\w])", lambda _m: home, w)
+        if w.startswith("~/"):
+            w = home + w[1:]
+        cands = [w] if os.path.isabs(w) else [os.path.join(b, w) for b in base_dirs]
+        hit = [c for c in cands if os.path.isfile(c)]
+        if hit:
+            out.extend(hit)
+        else:
+            notes.append(f"unresolved script ref {w!r} in {path}")
+    return out
+
+
+def py_refs(text: str, path: str, roots: list[str], home: str, notes: list[str]) -> list[str]:
     """Local modules the file imports (any nesting), found with ast; stdlib/site-packages never match
-    because only files under the script dir or the cwd count."""
+    because only files under the script dir or the cwd count. Also scripts it names in strings."""
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
         notes.append(f"could not parse {path} for imports")
         return []
-    out: list[str] = []
+    out: list[str] = py_script_refs(tree, path, roots, home, notes)
     here = os.path.dirname(path)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -3435,8 +3517,9 @@ def py_refs(text: str, path: str, roots: list[str], notes: list[str]) -> list[st
 
 
 def discover_files(argv: list[str], program: str, cwd: str, home: str, extra: list[str]) -> tuple[list[str], list[str]]:
-    """The job's file set: argv files, PROMPT.md beside them, sourced shell helpers and imported
-    python modules (depth-capped), plus caller-supplied extras. OS-owned binaries are skipped."""
+    """The job's file set: argv files, PROMPT.md beside them, sourced shell helpers, imported python
+    modules, and the scripts and prompt files a shell or python file runs or reads (depth-capped),
+    plus caller-supplied extras. OS-owned binaries are skipped."""
     notes: list[str] = []
     seen: dict[str, int] = {}
     queue: list[tuple[str, int, str]] = []
@@ -3478,7 +3561,7 @@ def discover_files(argv: list[str], program: str, cwd: str, home: str, extra: li
         if kind == "sh":
             refs = shell_refs(text, base, cwd or base, home, notes, path)
         else:
-            refs = py_refs(text, path, [r for r in (main_dir, cwd) if r], notes)
+            refs = py_refs(text, path, [r for r in (main_dir, cwd) if r], home, notes)
         for r in refs:
             add(r, depth + 1, main_dir)
     return sorted(seen), sorted(set(notes))
