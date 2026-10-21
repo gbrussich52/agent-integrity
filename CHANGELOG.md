@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.2 (unreleased)
+
+### What changed
+- **`watch` warns as soon as an approved gated job drifts**, instead of waiting for the job's next
+  scheduled run to be refused. Prior code only notified from the gate at run time, so a weekly job edited
+  on Monday stayed silently blocked until its run, and the human learned about it a day or more late.
+  - New `warn_changed_loops`, called at the end of every `watch` run unless `--no-notify`. It is read-only
+    (the gate still decides), and its failures are caught so they cannot break `watch`.
+  - It sends the root config's `loops_notify_cmd` the message "LABEL changed since it was approved; its
+    next run will be refused until it is re-signed: ...", with `AGENT_INTEGRITY_NOTIFY_KIND=changed`.
+    Refusals from the gate now set `AGENT_INTEGRITY_NOTIFY_KIND=refused`.
+  - Dedupe: one notice per label per set of changes, repeated daily while it stays changed, in
+    `loops-warned.json` in the user dir. That file is user-writable, so this is a convenience; the
+    refusal notice from the gate is still the backstop.
+- `run_notify` takes an optional `kind` (default `refused`).
+
 ## 0.4.1 (unreleased)
 
 ### What changed

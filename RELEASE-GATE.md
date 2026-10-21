@@ -53,6 +53,8 @@ record the pass rate in `bench/HISTORY.md`; it must be at least 90%.
 the cwd, a followed wrapper chain, prompt files and `SKILL.md` by name, a python subprocess helper, a
 script the wrapper starts calling later (refused), and the negatives (`> report.md`, data files, URLs,
 globs are not pinned; unresolved candidates become notes).
+0.4.2 adds 7e/7f: `watch` warns once when an approved gated job changes before its run (deduped per change
+set, repeated daily, never runs the job), and a missing store or broken notifier changes nothing.
 `tests/test_hook_and_install.py` also installs into a store path containing a space, parses the daemon
 plist with `plistlib` and asserts `--store` is one element.
 

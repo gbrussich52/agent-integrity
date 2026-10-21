@@ -17,6 +17,17 @@ from unittest import mock
 from helpers import SCRIPT, Env
 
 LABEL = "test.job.one"
+_MOD = None
+
+
+def _module():
+    global _MOD
+    if _MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("agent_integrity_loops_mod", SCRIPT)
+        _MOD = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_MOD)
+    return _MOD
 
 
 class LoopsEnv(Env):
@@ -378,6 +389,40 @@ class LoopsReleaseGate(LoopsEnv):
             self.assertEqual(self.gate().returncode, 3)
         self.assertEqual(len(self.refused_lines()), 1)
         self.assertEqual(len(counter.read_text().splitlines()), 1)
+
+    def test_7e_watch_warns_once_when_an_approved_job_changes_before_it_runs(self):
+        self.approve()
+        mod = _module()
+        log = self.tmp / "notes.txt"
+        hook = self.tmp / "note.sh"
+        hook.write_text(f'#!/bin/sh\necho "$AGENT_INTEGRITY_NOTIFY_KIND|$AGENT_INTEGRITY_LOOP_LABEL|$1" >> "{log}"\n')
+        hook.chmod(0o755)
+        (self.store / "config.json").write_text(json.dumps({"loops_notify_cmd": [str(hook)]}))
+        store = mod.Store(str(self.store))
+        self.assertEqual(mod.warn_changed_loops(store, self.home, self.user, 1000.0), 0)   # approved: quiet
+        self.assertFalse(log.exists())
+        with open(self.jobs / "run.sh", "a") as fh:
+            fh.write("echo edited\n")
+        self.assertEqual(mod.warn_changed_loops(store, self.home, self.user, 1000.0), 1)
+        self.assertEqual(mod.warn_changed_loops(store, self.home, self.user, 2000.0), 0)   # same change: deduped
+        lines = log.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(f"changed|{LABEL}|"), lines[0])
+        self.assertIn("will be refused", lines[0])
+        self.assertIn("run.sh", lines[0])
+        (self.jobs / "PROMPT.md").write_text("A different prompt.\n")                    # new change: new notice
+        self.assertEqual(mod.warn_changed_loops(store, self.home, self.user, 3000.0), 1)
+        self.assertEqual(mod.warn_changed_loops(store, self.home, self.user, 3000.0 + 86400), 1)  # daily repeat
+        self.assertFalse(self.out.exists(), "a warning must never run the job")
+
+    def test_7f_watch_warning_survives_no_store_and_a_broken_notifier(self):
+        mod = _module()
+        self.assertEqual(mod.warn_changed_loops(mod.Store(str(self.tmp / "nowhere")), self.home, self.user, 1.0), 0)
+        self.approve()
+        (self.store / "config.json").write_text(json.dumps({"loops_notify_cmd": ["/nonexistent/notifier"]}))
+        (self.jobs / "run.sh").write_text("#!/bin/sh\necho changed\n")
+        self.assertEqual(mod.warn_changed_loops(mod.Store(str(self.store)), self.home, self.user, 1.0), 1)
+        self.assert_refused(self.gate(), "run.sh")
 
     # 8 -----------------------------------------------------------------------------------
     def test_8_gate_runs_the_approved_argv_never_one_from_an_edited_plist(self):

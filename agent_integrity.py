@@ -65,7 +65,7 @@ try:                       # advisory file locking for the audit log; absent on 
 except ImportError:        # pragma: no cover
     fcntl = None
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 NAMESPACE = "agent-integrity"   # ssh-keygen -Y namespace: a signature made for another purpose won't verify
 PRINCIPAL = "agent-integrity"
 SELF = Path(__file__).resolve()
@@ -3143,7 +3143,51 @@ def cmd_watch(args, notifier=None) -> int:
         print(line)
     for line in render_slow_text(views["slow"]):
         print(line)
+    if not getattr(args, "no_notify", False):
+        try:
+            warn_changed_loops(store, home, user, now)
+        except Exception as e:         # a warning pass must never break the watch run
+            print(f"agent-integrity: loop change warning skipped: {type(e).__name__}", file=sys.stderr)
     return res.exit
+
+
+LOOP_WARN_EVERY = 86400
+
+
+def warn_changed_loops(store: Store, home: Path, user: Path, now: float) -> int:
+    """Tell the human as soon as an approved gated job has drifted, instead of waiting for its next
+    scheduled run to be refused (a weekly job can sit blocked for days). Read-only: the gate still
+    decides. One notice per label per changed-file set, repeated daily while it stays changed.
+    The dedupe state is user-writable, so this is a convenience; the refusal notice is the backstop."""
+    if not store.loops.is_file():
+        return 0
+    cfg = store.config()
+    try:
+        m, _ = load_trusted_manifest(store, "loops")
+    except Untrusted:
+        return 0
+    states = loops_states(m["jobs"], home, home / "Library" / "LaunchAgents", forbid_dirs_of(cfg, home))
+    seen_path = user / "loops-warned.json"
+    seen = load_json(seen_path)
+    keep, sent = {}, 0
+    for label, st in sorted(states.items()):
+        if st["state"] != "changed" or st.get("mode") != "gated":
+            continue
+        key = hashlib.sha256("\n".join(sorted(st["changes"])).encode()).hexdigest()[:16]
+        prev = seen.get(label) if isinstance(seen.get(label), dict) else {}
+        if prev.get("key") == key and now - float(prev.get("ts", 0)) < LOOP_WARN_EVERY:
+            keep[label] = prev
+            continue
+        msg = (f"agent-integrity: {label} changed since it was approved; its next run will be refused until "
+               f"it is re-signed: " + "; ".join(clean_text(c, 160) for c in st["changes"][:3]))
+        run_notify(cfg, msg, label, user / "loops-refused.jsonl", kind="changed")
+        keep[label] = {"key": key, "ts": int(now)}
+        sent += 1
+    try:
+        atomic_write(seen_path, json.dumps(keep, indent=1, sort_keys=True))
+    except OSError:
+        pass
+    return sent
 
 
 def cmd_report(args) -> int:
@@ -3725,13 +3769,15 @@ def log_refusal(user: Path, entry: dict) -> bool:
     return True
 
 
-def run_notify(cfg: dict, msg: str, label: str, log: Path) -> None:
+def run_notify(cfg: dict, msg: str, label: str, log: Path, kind: str = "refused") -> None:
     """Optional alert hook from the root-owned config. Its failure is deliberately invisible to the
-    gate: a broken notifier must never be a way to make a refusal turn into a run."""
+    gate: a broken notifier must never be a way to make a refusal turn into a run. `kind` is
+    "refused" (the gate just refused) or "changed" (watch saw an approved job drift before its run)."""
     cmd = cfg.get("loops_notify_cmd")
     if not (isinstance(cmd, list) and cmd and all(isinstance(x, str) for x in cmd)):
         return
-    env = {"PATH": DEFAULT_JOB_PATH, "AGENT_INTEGRITY_LOOP_LABEL": label, "AGENT_INTEGRITY_REFUSED_LOG": str(log)}
+    env = {"PATH": DEFAULT_JOB_PATH, "AGENT_INTEGRITY_LOOP_LABEL": label, "AGENT_INTEGRITY_REFUSED_LOG": str(log),
+           "AGENT_INTEGRITY_NOTIFY_KIND": kind}
     for k in KEEP_ENV:
         if k in os.environ:
             env[k] = os.environ[k]
