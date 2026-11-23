@@ -204,6 +204,9 @@ data it works on.
   signature hit there is still a threat. `watch_paths` takes absolute paths outside the built-in
   surfaces; every file there is hashed and scanned and drift is raising. `baseline` and `check` both
   read `projects` and `watch_paths`.
+  Set them at install time: `sudo ./install-root.sh ... --project DIR --watch-path PATH` (both
+  repeatable). The installer rewrites `config.json` from its flags on every run, so pass them all
+  each time.
 
 ## Explanation clarity benchmark (`bench/`)
 

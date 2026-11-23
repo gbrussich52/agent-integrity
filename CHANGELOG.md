@@ -3,6 +3,7 @@
 ## 0.4.3 (unreleased)
 
 ### What changed
+- `install-root.sh --watch-path PATH` (repeatable) writes `watch_paths` into the root-owned config.
 - **Symlinks inside a watched root are recorded and followed.** Prior code stored only the text of a
   link and never followed it, so `~/.claude/skills/<name>` linked to a directory elsewhere was watched as
   one line and a poisoned `SKILL.md` behind it loaded unwatched.
