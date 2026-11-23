@@ -58,6 +58,14 @@ set, repeated daily, never runs the job), and a missing store or broken notifier
 `tests/test_hook_and_install.py` also installs into a store path containing a space, parses the daemon
 plist with `plistlib` and asserts `--store` is one element.
 
+## Source gaps (0.4.3)
+`tests/test_sources.py` (16 tests, temp dirs and temp git repos only): a linked skill directory is hashed,
+an edit behind a directory or file link is changed, a retarget is raising, a link cycle terminates, an
+over-cap link is reported every run; a clean marketplace clone is accepted (E9) while a local edit, a wrong
+`origin` and a signature hit are not; plugin trash is skipped by default with a visible count, `[]` hashes
+it, and a `.trash` folder elsewhere is watched; vendor-sync drift stays at review-soon with no alert while a
+signature hit there is a threat with a red alert.
+
 ## What the human must do once (the agent never does these)
 With autopilot the human steps shrink to the one-time key, `install-root.sh` and `install-user.sh`;
 after that only risk-raising changes ask for a signature.

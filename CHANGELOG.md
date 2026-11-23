@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.4.3 (unreleased)
+
+### What changed
+- **Symlinks inside a watched root are recorded and followed.** Prior code stored only the text of a
+  link and never followed it, so `~/.claude/skills/<name>` linked to a directory elsewhere was watched as
+  one line and a poisoned `SKILL.md` behind it loaded unwatched.
+  - A link's digest is now `symlink:<as written> => <resolved>`, plus the target's sha256 for a link to a
+    file. A link to a directory is walked too, its files keyed under the link path, and signature-scanned
+    and fingerprinted through the link.
+  - A retargeted link, or a file swapped for a link (or back), is `raising` at least, and is never
+    accepted on marketplace provenance or by settling.
+  - Cycles stop on the chain of real directories being walked. Nesting is capped at 8 links and files are
+    capped per link by `link_max_files` (store config, default 2000). A link over either cap is a finding
+    on every run (`links` in JSON, `! LINK` in text, a SARIF error, one red alert), never a silent skip.
+  - Pre-0.4.3 link records compare by the text of the link, so an upgrade alone reads as "changed", not
+    as a retarget.
+- **Marketplace git clones (E9).** Prior code accepted marketplace drift only for official sources (E8),
+  so a refresh of any other marketplace clone showed as hundreds of changed and added files. Files under
+  `~/.claude/plugins/marketplaces/<name>/` are now accepted when the signed manifest recorded that
+  marketplace with today's source, the clone's single `origin` URL matches it (`owner/name`, https and
+  scp-style GitHub forms compare equal), `git status --porcelain --untracked-files=all` is empty, `HEAD`
+  is on a remote-tracking ref of `origin`, and the file has no high-severity signature hit. Otherwise
+  the drift is listed and a note gives the reason. Before git runs, `.git` must be a real directory
+  and `.git/config` must hold only allowlisted sections and keys (no fsmonitor, filters, includes or
+  other program-running settings). Git is called with an argument list, a 20 s timeout, a scrubbed
+  environment, no system or global config, `--no-optional-locks`, and `core.fsmonitor`/`core.hooksPath`
+  forced off.
+- **`ignore_paths` (store config, default `["~/.claude/plugins/.trash"]`).** Prior code skipped every
+  directory named `.trash` anywhere, silently, so `hooks/.trash/x.sh` was unwatched. Now only the listed
+  paths are skipped, every report and `baseline` print how many files the list skipped, and `[]` hashes
+  them. The host app moves removed plugins into that folder and documents that they are hidden from
+  every session and re-downloaded, never restored.
+- **`vendor_sync_paths` (store config, default `["~/.claude/skills/synced"]`).** A vendor's skill sync
+  rewrites that folder and provenance cannot be proven locally. Drift there is the `vendor-sync` class:
+  listed in every report at `review-soon`, never settled, never sent as an alert (red or daily amber),
+  also in the slow-drift rules. A high-severity signature hit there is still a threat and alerts; a
+  retargeted link there is still raising.
+- The walk settings are read from the store's `config.json` only, never from the user-dir config.
+- Tests: `tests/test_sources.py` (16 tests; 15 fail on 0.4.2, the vendor threat test is a guard).
+
 ## 0.4.2 (unreleased)
 
 ### What changed

@@ -178,6 +178,28 @@ are not hashed; others, such as a Homebrew python, are. A program that reads a d
 list (a config, a queue) is only as safe as that file. The gate protects the job's definition, not the
 data it works on.
 
+## Links, marketplace clones, ignore list, vendor-sync (0.4.3)
+
+- **Symlinks are followed.** A link inside a watched root is recorded (as written and resolved) and, for
+  a directory, its files are hashed and scanned under the link path. A retargeted link is `raising`.
+  Cycles stop; nesting is capped at 8; `link_max_files` (default 2000) caps files per link. A link over
+  a cap is reported on every run.
+- **Marketplace clones (E9).** Drift under `~/.claude/plugins/marketplaces/<name>/` is accepted only when
+  the signed manifest recorded the marketplace with today's source, `origin` matches it, the clone is
+  clean with `HEAD` on a commit from `origin`, and the file scans clean. A clone that is not a git
+  repository, is dirty, points elsewhere or carries program-running git config is listed with the reason.
+- **Store `config.json` keys** (the user-dir config cannot set these):
+
+  ```json
+  {"ignore_paths": ["~/.claude/plugins/.trash"],
+   "vendor_sync_paths": ["~/.claude/skills/synced"],
+   "link_max_files": 2000}
+  ```
+
+  `ignore_paths` are never hashed; each report prints how many files that skipped. `[]` hashes them.
+  `vendor_sync_paths` drift is listed every run at review-soon and never alerts; a high-severity
+  signature hit there is still a threat.
+
 ## Explanation clarity benchmark (`bench/`)
 
 `bench/run.py --model gpt-oss:20b` runs the real explainer prompt on 15 realistic changes against a
@@ -212,7 +234,9 @@ Read this before you rely on it.
   new behaviour, not a malware scanner.
 - **Provenance is narrow.** Plugin updates are auto-accepted only when the signed manifest
   recorded the marketplace, its source is unchanged and matches an official prefix
-  (default `anthropics/`), and the changed files have no high-severity hit. Anything else is shown.
+  (default `anthropics/`), and the changed files have no high-severity hit. A marketplace git clone is
+  also accepted when git shows it equals a commit from its recorded remote (E9); git state is local, so a
+  same-user attacker who rewrites the clone's refs can forge it. Anything else is shown.
 
 ### What it does not cover
 
