@@ -155,6 +155,17 @@ class InstallTests(Env):
         cfg = json.loads((self.tmp / "s2" / "config.json").read_text())
         self.assertNotIn("loops_notify_cmd", cfg)
         self.assertNotIn("loops_enforce", cfg)
+        self.assertNotIn("watch_paths", cfg)
+
+    def test_watch_path_flag_writes_watch_paths(self):
+        # Claude Fable 5.2, 2026-11-23: watch_paths is read from the store config only, and the
+        # installer rewrites that file, so the installer must be able to set it.
+        store, svc = self.tmp / "s", self.tmp / "svc"
+        r = self.run_install(*self.args(store, svc), "--watch-path", "/opt/agent gates",
+                             "--watch-path", "/etc/agent/policy.toml")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cfg = json.loads((store / "config.json").read_text())
+        self.assertEqual(cfg["watch_paths"], ["/opt/agent gates", "/etc/agent/policy.toml"])
 
     def baseline_to(self, store):
         return self.run_tool("baseline", "--pending-dir", str(self.pending), store=store)

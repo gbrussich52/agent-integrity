@@ -8,7 +8,10 @@
 #   2. copies the verifier (agent_integrity.py) and your PUBLIC signing key (as allowed_signers) into it
 #   3. writes config.json telling the verifier a fresh root heartbeat is required (optional:
 #      --notify-arg ARG, repeatable = the command the loop gate runs when it refuses a job;
-#      --enforce-loops = the root daemon boots out launch agents that are not approved)
+#      --enforce-loops = the root daemon boots out launch agents that are not approved;
+#      --project DIR, repeatable = a project whose agent files are watched;
+#      --watch-path PATH, repeatable = an extra absolute path where every file is hashed and drift raises).
+#      Each run rewrites config.json from its flags, so pass them all again when you re-run it.
 #   4. installs a root launchd daemon (macOS) or systemd timer (Linux) that runs `check` hourly
 #
 # What it never does: touch your private key, your agent configs, or anything outside the store
@@ -26,6 +29,7 @@ PUBKEY=""
 USER_HOME=""
 PROJECTS_JSON=""
 NOTIFY_JSON=""
+WATCH_JSON=""
 ENFORCE_LOOPS=0
 INTERVAL=3600
 NO_SERVICE=0
@@ -44,6 +48,9 @@ while [ $# -gt 0 ]; do
     --pubkey) PUBKEY="$2"; shift 2 ;;
     --user-home) USER_HOME="$2"; shift 2 ;;
     --project) PROJECTS_JSON="${PROJECTS_JSON:+$PROJECTS_JSON,}$(json_str "$2")"; shift 2 ;;
+    # Claude Fable 5.2, 2026-11-23: watch_paths is trusted only from this root-written config, and
+    # this script rewrites that file, so it needs a flag for it. Repeatable; absolute paths.
+    --watch-path) WATCH_JSON="${WATCH_JSON:+$WATCH_JSON,}$(json_str "$2")"; shift 2 ;;
     --notify-arg) NOTIFY_JSON="${NOTIFY_JSON:+$NOTIFY_JSON,}$(json_str "$2")"; shift 2 ;;   # repeatable: loops_notify_cmd argv
     --enforce-loops) ENFORCE_LOOPS=1; shift ;;
     --interval) INTERVAL="$2"; shift 2 ;;
@@ -95,6 +102,7 @@ printf 'agent-integrity namespaces="agent-integrity" %s %s\n' "$KEYTYPE" "$KEYBO
 # user account, so an agent cannot point the alert at itself or switch enforcement off.
 CONFIG_EXTRA=""
 [ -z "$NOTIFY_JSON" ] || CONFIG_EXTRA="$CONFIG_EXTRA, \"loops_notify_cmd\": [$NOTIFY_JSON]"
+[ -z "$WATCH_JSON" ] || CONFIG_EXTRA="$CONFIG_EXTRA, \"watch_paths\": [$WATCH_JSON]"
 [ "$ENFORCE_LOOPS" -eq 0 ] || CONFIG_EXTRA="$CONFIG_EXTRA, \"loops_enforce\": true"
 cat > "$STORE/config.json" <<EOF
 {"heartbeat_required": true, "stale_after": $((INTERVAL * 3)), "home": $(json_str "$USER_HOME"), "projects": [$PROJECTS_JSON]$CONFIG_EXTRA}

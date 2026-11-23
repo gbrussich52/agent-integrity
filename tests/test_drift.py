@@ -1,4 +1,8 @@
-"""Reviewable drift: grouping, official-marketplace auto-accept, and the 5,000-file break test."""
+"""Reviewable drift: grouping, the marketplace-refresh class, and the 5,000-file break test.
+
+Claude Opus 5.5, 2026-11-23: the official-marketplace auto-accept (E8) is gone. It checked only the
+recorded source string, so its updates are now listed as one marketplace-refresh line instead.
+"""
 import json
 import unittest
 
@@ -32,10 +36,11 @@ class DriftTests(Env):
         self.assertLessEqual(len(lines), 20, r.stdout)
         self.assertIn("settings.json", r.stdout)
         self.assertIn("mcpServers", r.stdout)
-        self.assertRegex(r.stdout, rf"auto-accepted {N} official-marketplace file")
+        self.assertRegex(r.stdout, rf"marketplace refresh official-mp: {N} changed")
+        self.assertNotIn("auto-accepted", r.stdout)
         self.assertNotIn("f17.md", r.stdout)
 
-    def test_unofficial_churn_is_not_auto_accepted_but_stays_compact(self):
+    def test_unofficial_churn_is_one_refresh_line_and_stays_compact(self):
         self.marketplaces()
         self.churn("other-mp", "v1", 1500)
         self.trusted_baseline()
@@ -46,9 +51,9 @@ class DriftTests(Env):
         self.assertNotIn("auto-accepted", r.stdout)
         self.assertLessEqual(len(r.stdout.splitlines()), 20, r.stdout)
         self.assertIn("settings.json", r.stdout)
-        self.assertIn("other-mp", r.stdout)
+        self.assertIn("marketplace refresh other-mp: 1500 changed", r.stdout)
 
-    def test_official_update_with_signature_hit_is_not_accepted(self):
+    def test_official_update_with_signature_hit_is_not_in_the_refresh(self):
         self.marketplaces()
         self.churn("official-mp", "v1", 20)
         self.trusted_baseline()
@@ -58,7 +63,7 @@ class DriftTests(Env):
         self.assertEqual(r.returncode, 1)
         self.assertIn("f3.md", r.stdout)
         self.assertIn("remote-exec", r.stdout)
-        self.assertRegex(r.stdout, r"auto-accepted 19 official")
+        self.assertRegex(r.stdout, r"marketplace refresh official-mp: 19 changed")
 
     def test_marketplace_source_changed_voids_provenance(self):
         self.marketplaces()
@@ -68,7 +73,7 @@ class DriftTests(Env):
         self.churn("official-mp", "v2", 10)
         r = self.run_tool("check", "--format", "json")
         d = json.loads(r.stdout)
-        self.assertEqual(d["auto_accepted"], 0)
+        self.assertFalse([i for i in d["items"] if i.get("class") == "marketplace-refresh"])
         self.assertEqual(r.returncode, 1)
 
     def test_marketplace_added_after_signing_never_qualifies(self):
@@ -77,15 +82,19 @@ class DriftTests(Env):
         self.marketplaces()
         self.churn("official-mp", "v2", 5)
         d = json.loads(self.run_tool("check", "--format", "json").stdout)
-        self.assertEqual(d["auto_accepted"], 0)
+        self.assertGreaterEqual(len(d["items"]), 5)        # the files, plus known_marketplaces.json itself
+        self.assertFalse([i for i in d["items"] if i.get("class") == "marketplace-refresh"])
 
-    def test_substring_source_is_not_official(self):
+    def test_official_prefix_grants_nothing(self):
         self.marketplaces(official="evil/anthropics/plugins")
         self.churn("official-mp", "v1", 5)
         self.trusted_baseline()
         self.churn("official-mp", "v2", 5)
-        d = json.loads(self.run_tool("check", "--format", "json").stdout)
-        self.assertEqual(d["auto_accepted"], 0)
+        r = self.run_tool("check", "--format", "json")
+        d = json.loads(r.stdout)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(len(d["items"]), 5)                 # every file listed, none accepted
+        self.assertNotIn("auto_accepted", d)
 
     def test_grouped_by_source(self):
         self.trusted_baseline()

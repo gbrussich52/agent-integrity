@@ -59,13 +59,14 @@ import urllib.request
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 try:                       # advisory file locking for the audit log; absent on non-POSIX
     import fcntl
 except ImportError:        # pragma: no cover
     fcntl = None
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 NAMESPACE = "agent-integrity"   # ssh-keygen -Y namespace: a signature made for another purpose won't verify
 PRINCIPAL = "agent-integrity"
 SELF = Path(__file__).resolve()
@@ -112,7 +113,37 @@ CODEISH = {".md", ".mdc", ".json", ".sh", ".py", ".js", ".mjs", ".ts", ".toml", 
            ".bash", ".zsh", ".txt"}
 # Never watched: tool caches, VCS internals, and the agent's own scratch areas, which churn
 # constantly and would bury a real change.
-SKIP_PARTS = {"node_modules", ".git", "__pycache__", ".venv", "logs", ".DS_Store", ".trash", "worktrees"}
+# Claude Opus 5.5, 2026-11-22: ".trash" moved out of this set into the ignore_paths config key. As a
+# name it skipped every directory called .trash anywhere, so `hooks/.trash/x.sh` was unwatched.
+SKIP_PARTS = {"node_modules", ".git", "__pycache__", ".venv", "logs", ".DS_Store", "worktrees"}
+
+# Paths skipped on purpose (config `ignore_paths`, root-owned store config only). The plugin trash
+# holds removed plugins: the host hides them from every session and re-downloads, never restores, on
+# re-enable. Every report prints how many files the list skipped, so the skip is never silent.
+DEFAULT_IGNORE_PATHS = ["~/.claude/plugins/.trash"]
+# Paths a vendor's own sync rewrites (config `vendor_sync_paths`). Provenance cannot be proven
+# locally, so drift there is listed at review-soon on every run and never pages; a high-severity
+# signature hit there is still a threat.
+DEFAULT_VENDOR_SYNC_PATHS = ["~/.claude/skills/synced"]
+VENDOR_CLASS = "vendor-sync"
+# Claude Opus 5.5, 2026-11-23: drift under a plugin marketplace the signed manifest recorded, from the
+# source it still names today. That proves the name and the source string, not the bytes, so the
+# class is listed at review-soon (one line per marketplace), never paged and never accepted. It
+# replaces the 0.4.2 official-marketplace auto-accept (E8), which checked the same strings and
+# accepted on them.
+REFRESH_CLASS = "marketplace-refresh"
+QUIET_CLASSES = {VENDOR_CLASS, REFRESH_CLASS}
+
+
+class Rules(NamedTuple):
+    """Path classes refine_risk applies, in key form (~/... or absolute)."""
+    vendor: list = list(DEFAULT_VENDOR_SYNC_PATHS)
+    refresh: frozenset = frozenset()       # marketplace names that qualify as a refresh this run
+    watch: list = []                       # watch_paths: drift there is raising
+# A symlink inside a watched root is recorded and followed. Caps keep one link to a huge tree from
+# stalling the hourly run; hitting one is a finding on every run, never a silent skip.
+DEFAULT_LINK_MAX_FILES = 2000
+LINK_MAX_DEPTH = 8
 
 # The plugin installer clones into scratch dirs under plugins/cache/ and deletes them when the
 # install settles. Baselining them produces permanent REMOVED drift the next time it cleans up.
@@ -153,9 +184,6 @@ SIG_DESC = {
     "hidden-unicode": "Contains invisible or bidirectional-control unicode.",
 }
 
-# Marketplaces whose plugin updates may be auto-accepted: only when the SIGNED manifest
-# recorded the marketplace with a source matching one of these prefixes (or a config override).
-DEFAULT_OFFICIAL_SOURCES = ["anthropics/", "github.com/anthropics/", "https://github.com/anthropics/"]
 DEFAULT_STALE_AFTER = 3 * 3600   # root check runs hourly; three missed runs = stale
 MAX_SCAN_BYTES = 2 * 1024 * 1024
 
@@ -236,12 +264,48 @@ def _drop_fields(obj, fields):
     return obj
 
 
+def _path_list(cfg: dict, key: str, default: list[str]) -> list[str]:
+    """A list-of-paths config key; anything malformed falls back to the default, never to 'all'."""
+    v = cfg.get(key, default)
+    if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+        return list(default)
+    return list(v)
+
+
 class Ctx:
     """Everything path-dependent in one object: home, projects, and key<->path mapping."""
 
-    def __init__(self, home: Path, projects: list[Path]):
+    def __init__(self, home: Path, projects: list[Path], cfg: dict | None = None):
         self.home = Path(home)
         self.projects = [Path(p) for p in projects]
+        # Claude Opus 5.5, 2026-11-22: walk settings come from the store config (root-owned when
+        # protected); a user-writable config must not be able to hide a path or loosen a cap.
+        cfg = cfg or {}
+        self.ignore = [self.expand(x) for x in _path_list(cfg, "ignore_paths", DEFAULT_IGNORE_PATHS)]
+        self.vendor = [self.expand(x) for x in _path_list(cfg, "vendor_sync_paths", DEFAULT_VENDOR_SYNC_PATHS)]
+        try:
+            self.link_cap = max(1, int(cfg.get("link_max_files", DEFAULT_LINK_MAX_FILES)))
+        except (TypeError, ValueError):
+            self.link_cap = DEFAULT_LINK_MAX_FILES
+        # Claude Opus 5.5, 2026-11-23: watch_paths = absolute dirs or files outside the built-in
+        # surfaces (a gates dir, a shared script). Every file there is hashed and scanned.
+        self.watch = [w for w in (self.expand(x) for x in _path_list(cfg, "watch_paths", [])) if os.path.isabs(w)]
+        self.ignored = 0                    # files skipped by ignore_paths in the last walk
+        self.links: list[dict] = []         # link findings (over cap, too deep) from the last walk
+
+    def expand(self, p: str) -> str:
+        return os.path.normpath(str(self.home) + p[1:] if p.startswith("~/") or p == "~" else p)
+
+    def is_ignored(self, p: Path) -> bool:
+        s = str(p)
+        return any(s == d or s.startswith(d + os.sep) for d in self.ignore)
+
+    def vendor_keys(self) -> list[str]:
+        return [self.key(Path(d)) for d in self.vendor]
+
+    def rules(self, signed_mp: dict | None = None) -> Rules:
+        return Rules(self.vendor_keys(), refresh_set(signed_mp or {}, marketplace_sources(self.home)),
+                     [self.key(Path(w)) for w in self.watch])
 
     def key(self, p: Path) -> str:
         s = str(p)
@@ -253,7 +317,7 @@ class Ctx:
 
     def digest(self, p: Path) -> str:
         if p.is_symlink():
-            return "symlink:" + os.readlink(p)
+            return link_digest(p)
         for suffix, fields in VOLATILE_JSON_FIELDS.items():
             if str(p).endswith(suffix):
                 try:
@@ -264,28 +328,137 @@ class Ctx:
         return sha_file(p)
 
 
-def _walk(root: Path):
+# Claude Opus 5.5, 2026-11-22: links are recorded as "symlink:<as written> => <resolved>" and, for a
+# link to a regular file, the target's sha256. Prior code stored only the text of the link and never
+# followed it, so a poisoned file behind a linked skill directory loaded unwatched.
+def link_digest(p: Path) -> str:
+    raw, real = os.readlink(p), os.path.realpath(p)
+    rec = f"symlink:{raw} => {real}"
+    if os.path.isfile(real):
+        try:
+            return f"{rec} sha256:{sha_file(Path(real))}"
+        except OSError:
+            return rec + " unreadable"
+    return rec
+
+
+def link_parts(digest: str) -> tuple[str, str | None] | None:
+    """(as written, resolved or None for a pre-0.4.3 record) for a link digest, else None."""
+    if not isinstance(digest, str) or not digest.startswith("symlink:"):
+        return None
+    body = digest[len("symlink:"):]
+    if " => " not in body:
+        return body, None
+    raw, rest = body.split(" => ", 1)
+    return raw, rest.split(" sha256:", 1)[0].removesuffix(" unreadable")
+
+
+def link_change(old: str, new: str) -> str | None:
+    """Plain-English line when a link was retargeted or a file and a link swapped, else None."""
+    o, n = link_parts(old), link_parts(new)
+    if o is None and n is None:
+        return None
+    if o is None or n is None:
+        if old in ("-", None) or new in ("-", None):
+            return None                     # plain add or remove of a link
+        return (f"replaced by a link to {n[1] or n[0]}" if n else "link replaced by a regular file")
+    if o[0] != n[0] or (o[1] is not None and n[1] is not None and o[1] != n[1]):
+        return f"link retargeted: {o[1] or o[0]} -> {n[1] or n[0]}"
+    return None
+
+
+def _codeish(p: Path, every: bool = False) -> bool:
+    return every or p.suffix.lower() in CODEISH or p.parent.name in {"hooks", "gates"}
+
+
+def _count_ignored(root: Path) -> int:
+    n = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_PARTS]
-        # A symlink is recorded by its target, never followed (os.walk doesn't follow dirs).
+        n += sum(1 for f in filenames if f not in SKIP_PARTS and (_codeish(Path(dirpath) / f)
+                                                               or os.path.islink(os.path.join(dirpath, f))))
+    return n
+
+
+def _walk(root: Path, ctx: Ctx | None = None, chain: tuple = (), depth: int = 0, budget: dict | None = None,
+          every: bool = False):
+    """Watched files below root. A symlink is yielded itself (its digest records the target), and a
+    link to a directory is then walked too, keyed under the link path. Cycles stop on the chain of
+    real directories already being walked; depth and per-link file caps become findings."""
+    ctx = ctx or Ctx(Path.home(), [])
+    chain = chain + (os.path.realpath(root),)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        keep = []
+        for d in dirnames:
+            p = Path(dirpath) / d
+            if d in SKIP_PARTS:
+                continue
+            if ctx.is_ignored(p):
+                ctx.ignored += _count_ignored(p)
+                continue
+            keep.append(d)
+        dirnames[:] = keep
         for name in list(dirnames):
             p = Path(dirpath) / name
             if p.is_symlink():
                 dirnames.remove(name)
+                if not _take(budget):
+                    return
                 yield p
-        for name in filenames:
+                yield from _follow(p, ctx, chain, depth, budget, every)
+                if budget and budget["over"]:
+                    return
+        for name in sorted(filenames):
             if name in SKIP_PARTS:
                 continue
             p = Path(dirpath) / name
             if EPHEMERAL_PLUGIN_CLONE_RE.search(str(p)):
                 continue
-            if p.is_symlink() or p.suffix.lower() in CODEISH or Path(dirpath).name in {"hooks", "gates"}:
+            if ctx.is_ignored(p):
+                ctx.ignored += 1 if (p.is_symlink() or _codeish(p, every)) else 0
+                continue
+            if p.is_symlink() or _codeish(p, every):
+                if not _take(budget):
+                    return
                 yield p
+
+
+def _take(budget: dict | None) -> bool:
+    if budget is None:
+        return True
+    if budget["n"] >= budget["cap"]:
+        budget["over"] = True
+        return False
+    budget["n"] += 1
+    return True
+
+
+def _follow(link: Path, ctx: Ctx, chain: tuple, depth: int, budget: dict | None, every: bool = False):
+    real = os.path.realpath(link)
+    if not os.path.isdir(real):
+        return                               # a file link: its digest already carries the content hash
+    here = os.path.realpath(link.parent)
+    if real in chain or here == real or here.startswith(real.rstrip(os.sep) + os.sep):
+        return                               # cycle: the target is already being walked
+    if depth + 1 > LINK_MAX_DEPTH:
+        ctx.links.append({"key": ctx.key(link), "target": real,
+                          "reason": f"links nest deeper than {LINK_MAX_DEPTH}; this one is not followed"})
+        return
+    own = budget is None
+    if own:
+        budget = {"n": 0, "cap": ctx.link_cap, "over": False}
+    yield from _walk(link, ctx, chain, depth + 1, budget, every)
+    if own and budget["over"]:
+        ctx.links.append({"key": ctx.key(link), "target": real,
+                          "reason": f"more than {ctx.link_cap} files behind this link (link_max_files cap); "
+                                    "files past the cap are not hashed"})
 
 
 def surface_files(ctx: Ctx, tier: str):
     """Yield (agent, Path) for every watched file at this tier."""
     seen = set()
+    ctx.ignored, ctx.links = 0, []
     bases = {"home": [ctx.home], "project": ctx.projects}
     for s in SURFACES:
         if tier != "all" and s["tier"] != tier:
@@ -295,13 +468,35 @@ def surface_files(ctx: Ctx, tier: str):
         for base in bases[s["base"]]:
             if s["kind"] == "dir":
                 root = base / s["path"]
-                cands = _walk(root) if root.is_dir() and not root.is_symlink() else ([root] if root.is_symlink() else [])
+                if root.is_symlink():
+                    cands = _root_link(root, ctx)
+                else:
+                    cands = _walk(root, ctx) if root.is_dir() else []
             else:
                 cands = [p for p in base.glob(s["path"]) if p.is_file() or p.is_symlink()]
             for p in cands:
                 if p not in seen:
                     seen.add(p)
                     yield s["agent"], p
+    if tier in ("all", "1"):
+        for w in ctx.watch:
+            root = Path(w)
+            if root.is_symlink():
+                cands = _root_link(root, ctx, every=True)
+            elif root.is_dir():
+                cands = _walk(root, ctx, every=True)
+            else:
+                cands = [root] if root.is_file() else []
+            for p in cands:
+                if p not in seen:
+                    seen.add(p)
+                    yield "watch-path", p
+
+
+def _root_link(root: Path, ctx: Ctx, every: bool = False):
+    """A watched directory that is itself a link: record it, then walk its target."""
+    yield root
+    yield from _follow(root, ctx, (), 0, None, every)
 
 
 def mcp_entries(ctx: Ctx, tier: str) -> dict[str, str]:
@@ -486,8 +681,9 @@ def marketplace_sources(home: Path) -> dict[str, str]:
     return out
 
 
-def is_official(source: str, official: list[str]) -> bool:
-    return bool(source) and any(source.startswith(p) for p in official)
+def refresh_set(signed_mp: dict, live_mp: dict) -> frozenset:
+    """Marketplaces the signed manifest recorded whose source string is the same today."""
+    return frozenset(mp for mp, src in signed_mp.items() if src and live_mp.get(mp) == src)
 
 
 # --- Semantic config diff ------------------------------------------------------------------
@@ -597,7 +793,7 @@ def config_fingerprints(ctx: Ctx, keys) -> dict:
                         pass
             continue
         p = ctx.path(k)
-        if p.is_file() and not p.is_symlink():
+        if p.is_file():          # Claude Opus 5.5, 2026-11-22: read through a link to its target
             fp = parse_config(ct, p)
             if fp is not None:
                 out[k] = fp
@@ -877,6 +1073,54 @@ def classify_item(kind: str, key: str, sigs: list, old_fp, new_fp, size_new: int
 
 
 # --- Result model --------------------------------------------------------------------------
+def class_group(cls: str, k: str) -> str:
+    return f"marketplace refresh {marketplace_of(k)}" if cls == REFRESH_CLASS else cls
+
+
+def is_vendor_key(k: str, prefixes: list[str]) -> bool:
+    return any(k == p.rstrip("/") or k.startswith(p.rstrip("/") + "/") for p in prefixes)
+
+
+def as_rules(r) -> Rules:
+    return r if isinstance(r, Rules) else Rules() if r is None else Rules(vendor=list(r))
+
+
+def item_class(k: str, rules: Rules) -> str | None:
+    if is_vendor_key(k, rules.vendor):
+        return VENDOR_CLASS
+    if is_plugin_key(k) and marketplace_of(k) in rules.refresh:
+        return REFRESH_CLASS
+    return None
+
+
+def refine_risk(kind: str, k: str, sigs: list, risk: str, lines: list, old_d: str, new_d: str,
+                rules) -> tuple[str, list, str | None]:
+    """(risk, lines, class) after the link, watch_paths and class rules. A signature hit always wins."""
+    rules = as_rules(rules)
+    # Claude Opus 5.5, 2026-11-22: retargeting a link (or swapping a file for one) is an attack shape,
+    # so it is raising at least, wherever it is. Vendor-synced drift is listed at review-soon on every
+    # run and never pages, because its provenance cannot be proven locally.
+    cls = item_class(k, rules)
+    if sigs:
+        return risk, lines, cls
+    relink = link_change(old_d, new_d)
+    if relink:
+        return ("raising" if RISK_RANK[risk] < 2 else risk), [f"{short_name(k)}: {relink} - raising"] + lines, cls
+    if is_vendor_key(k, rules.watch):
+        # Claude Opus 5.5, 2026-11-23: a path the owner named in watch_paths is one they load or run.
+        if RISK_RANK[risk] >= 2:
+            return risk, lines, cls
+        return "raising", [f"{short_name(k)}: file under watch_paths {kind} - raising"], cls
+    if cls == REFRESH_CLASS:
+        return "review-soon", [f"{short_name(k)}: file {kind} in a marketplace refresh ({marketplace_of(k)}); "
+                               "recorded source unchanged, contents unverified, signature scan clean "
+                               "- review-soon (marketplace-refresh)"], cls
+    if cls:
+        return "review-soon", [f"{short_name(k)}: vendor-synced file {kind}; provenance cannot be checked "
+                               "locally, signature scan clean - review-soon (vendor-sync)"], cls
+    return risk, lines, None
+
+
 def item_rank(it: dict) -> int:
     return RISK_RANK.get(it.get("final_risk") or it.get("risk") or "unknown", 2)
 
@@ -890,7 +1134,6 @@ class Result:
         self.seq: int | None = None
         # {kind, key, group, sigs, digest, risk, final_risk, lines, [llm]}
         self.items: list[dict] = []
-        self.auto_accepted = 0             # E8 (official marketplace), this run
         self.settled = 0                   # R-settle, this run
         self.scanned = 0
         self.notes: list[str] = []
@@ -901,12 +1144,16 @@ class Result:
         self.truncated = False
         # Scheduled jobs that differ from the signed loops manifest: {label, state, changes, enforce, action}
         self.loops: list[dict] = []
+        # Claude Opus 5.5, 2026-11-22: links that could not be fully watched (over cap, too deep),
+        # and files skipped by ignore_paths.
+        self.links: list[dict] = []
+        self.ignored = 0
+        self._rules: Rules = Rules()
         # Transient run state for the audit trail; never serialized.
         self.settled_items: list[dict] = []
         self._ctx = None
         self._new: dict = {}
         self._old_fp: dict = {}
-        self._e8: list[tuple] = []
         self._cur = None
 
     def counts(self) -> dict:
@@ -924,7 +1171,8 @@ class Result:
         return t
 
     def worst(self) -> int:
-        return max((item_rank(i) for i in self.items), default=0)
+        w = max((item_rank(i) for i in self.items), default=0)
+        return max(w, RISK_RANK["raising"]) if self.links else w
 
     def to_json(self, cap: int | None = None) -> dict:
         items = self.items
@@ -933,10 +1181,11 @@ class Result:
         return {"tool": "agent-integrity", "version": VERSION, "command": self.command, "tier": self.tier,
                 "status": self.status, "exit": self.exit, "reason": self.reason, "seq": self.seq,
                 "scanned": self.scanned, "counts": self.counts(), "mode": self.mode,
-                "auto_accepted": self.auto_accepted, "settled": self.settled, "risk": self.risk_tally(),
+                "settled": self.settled, "risk": self.risk_tally(),
                 "settling": self.settling[:50], "notes": self.notes, "stale_why": self.stale_why,
                 "truncated": cap is not None and len(self.items) > cap, "items": items,
-                "loops": self.loops[:200]}
+                "loops": self.loops[:200], "links": self.links[:200],
+                "ignored": self.ignored}
 
     @classmethod
     def from_json(cls, d: dict) -> "Result":
@@ -947,11 +1196,13 @@ class Result:
         for i in r.items:
             i.setdefault("sigs", [])
             i.setdefault("group", group_of(i["key"]))
-        r.auto_accepted, r.settled = int(d.get("auto_accepted", 0)), int(d.get("settled", 0))
+        r.settled = int(d.get("settled", 0))
         r.scanned, r.notes = int(d.get("scanned", 0)), list(d.get("notes", []))
         r.mode, r.stale_why = str(d.get("mode", "unprotected")), str(d.get("stale_why", ""))
         r.settling, r.truncated = list(d.get("settling", [])), bool(d.get("truncated"))
         r.loops = [x for x in d.get("loops", []) if isinstance(x, dict) and "label" in x]
+        r.links = [x for x in d.get("links", []) if isinstance(x, dict) and "key" in x and "reason" in x]
+        r.ignored = int(d.get("ignored", 0))
         return r
 
 
@@ -960,7 +1211,7 @@ def finalize(res: Result) -> None:
     if res.status in ("untrusted", "no-manifest"):
         return
     res.notes = [n for n in res.notes if not n.startswith("STALE:")]
-    if res.items or res.loops:
+    if res.items or res.loops or res.links:
         res.status, res.exit, res.reason = "drift", EXIT_DRIFT, ""
         if res.stale_why:
             res.notes.append("STALE: " + res.stale_why)
@@ -1144,7 +1395,7 @@ def run_check(args, store: Store, user: Path | None = None) -> Result:
             else:
                 old_fp.pop(k, None)
     projects = [Path(p) for p in (args.project or manifest.get("projects") or cfg.get("projects") or [])]
-    ctx = Ctx(home, projects)
+    ctx = Ctx(home, projects, store.config())
     new = snapshot(ctx, args.tier)
     res.scanned = len(new)
     res._ctx, res._new, res._old_fp = ctx, new, old_fp
@@ -1156,40 +1407,37 @@ def run_check(args, store: Store, user: Path | None = None) -> Result:
     if args.allow:
         allow.update(load_json(Path(args.allow)))
 
-    official = cfg.get("official_sources") or DEFAULT_OFFICIAL_SOURCES
-    signed_mp = manifest.get("marketplaces", {})
-    live_mp = marketplace_sources(ctx.home)
-
-    def trusted_marketplace(k: str) -> bool:
-        mp = marketplace_of(k)
-        # Provenance = the SIGNED manifest recorded this marketplace, from an official source,
-        # and its source today is the same. A marketplace added after signing never qualifies.
-        return bool(mp) and signed_mp.get(mp) is not None and signed_mp[mp] == live_mp.get(mp) \
-            and is_official(signed_mp[mp], official)
+    # Claude Opus 5.5, 2026-11-23: no file is accepted on provenance any more. A marketplace the
+    # signed manifest recorded, with the same source today, puts its drift in the refresh class.
+    rules = ctx.rules(manifest.get("marketplaces", {}))
+    res._rules = rules
 
     def sigs_for(k: str) -> list[str]:
         p = ctx.path(k)
-        return unreviewed_high(p, new.get(k, ""), allow) if p.is_file() and not p.is_symlink() else []
+        # Claude Opus 5.5, 2026-11-22: a link to a regular file is scanned through the link.
+        return unreviewed_high(p, new.get(k, ""), allow) if p.is_file() else []
 
     cfg_keys = [k for kk in (changed, added) for k in kk if config_type(k)]
     res.fps = config_fingerprints(ctx, cfg_keys)
     for kind, keys in (("changed", changed), ("added", added), ("removed", removed)):
         for k in keys:
             sigs = sigs_for(k) if kind != "removed" else []
-            # Nothing left to scan on removal: provenance alone is the basis.
-            if is_plugin_key(k) and trusted_marketplace(k) and not sigs:
-                res.auto_accepted += 1
-                res._e8.append((k, new.get(k, "-")))
-                continue
             try:
                 size = ctx.path(k).stat().st_size if kind != "removed" and not config_type(k) else None
             except OSError:
                 size = None
             risk, lines = classify_item(kind, k, sigs, old_fp.get(k), res.fps.get(k), size)
+            risk, lines, it_class = refine_risk(kind, k, sigs, risk, lines, old.get(k, "-"), new.get(k, "-"), rules)
+            group = class_group(it_class, k) if it_class and not sigs else group_of(k)
             bulk = is_plugin_key(k) and not config_type(k) and risk == "neutral"
-            res.items.append({"kind": kind, "key": k, "group": group_of(k), "sigs": sigs,
-                              "old": old.get(k, "-"), "digest": new.get(k, "-"), "risk": risk, "final_risk": risk,
-                              "lines": [] if bulk else [x[:300] for x in lines[:8]]})
+            item = {"kind": kind, "key": k, "group": group, "sigs": sigs,
+                    "old": old.get(k, "-"), "digest": new.get(k, "-"), "risk": risk, "final_risk": risk,
+                    "lines": [] if bulk else [x[:300] for x in lines[:8]]}
+            if it_class:
+                item["class"] = it_class
+            res.items.append(item)
+    res.links = list(ctx.links)
+    res.ignored = ctx.ignored
 
     apply_escalations(res, load_escalations(user))
     res.loops = loops_findings(store, home, cfg, res)
@@ -1231,32 +1479,36 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
         out = [f"agent-integrity: clean ({res.scanned} files, tier {res.tier}, manifest seq {res.seq})", ml]
         if res.settled:
             out.append(f"agent-integrity: auto-settled {res.settled} neutral change(s) after the cool-off (R-settle)")
-        if res.auto_accepted:
-            out.insert(0, auto_line(res.auto_accepted))
+        out.extend(extra_lines(res))
         return out
     c = res.counts()
     head = f"AGENT FILE DRIFT (tier {res.tier}): {c['changed']} changed, {c['added']} added, {c['removed']} removed"
-    if not res.items:
+    if not res.items and not res.loops:
+        head = f"AGENT LINK FINDINGS: {len(res.links)} symlink(s) not fully watched"
+    elif not res.items:
         head = f"AGENT LOOP DRIFT: {len(res.loops)} scheduled job(s) differ from the approved list"
     out = [head, ml]
     tally = res.risk_tally()
     if tally:
         out.append("risk: " + ", ".join(f"{tally[l]} {l}" for l in ("threat", "raising", "review-soon", "neutral") if l in tally))
-    if res.auto_accepted:
-        out.append(auto_line(res.auto_accepted))
     if res.settled:
         out.append(f"agent-integrity: auto-settled {res.settled} neutral change(s) after the cool-off (R-settle)")
+    out.extend(extra_lines(res))
     out.extend(res.notes)
+    out.extend(f"  ! LINK {x['key']} -> {x.get('target', '?')}: {x['reason']}" for x in res.links[:4])
+    if len(res.links) > 4:
+        out.append(f"  ! ... +{len(res.links) - 4} more link finding(s); use --format json")
     out.extend(loop_lines(res.loops))
     footer = "Read each one before an agent loads it. Then: baseline, sign."
-    if not res.items:
+    if not res.items and res.loops:
         footer = "Review each job, then: agent_integrity.py loops propose, loops sign."
     budget = max_lines - len(out) - 1
     if res.settling:
         budget -= 1
 
     # Plain-English change lines: config files and anything above neutral, worst first.
-    sem = [it for it in res.items if it.get("lines") and (config_type(it["key"]) or item_rank(it) >= 1)]
+    sem = [it for it in res.items if it.get("lines") and (config_type(it["key"]) or item_rank(it) >= 1)
+           and not is_refresh_group(it["group"])]
     sem.sort(key=lambda i: (-item_rank(i), i["key"]))
     sem_budget = min(max(budget - 4, 0), 8)
     sem_lines: list[str] = []
@@ -1294,8 +1546,9 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
     groups: dict[str, list[dict]] = {}
     for it in res.items:
         groups.setdefault(it["group"], []).append(it)
+    refresh = sorted(g for g in groups if is_refresh_group(g))
     plain = sorted(g for g in groups if not g.startswith(("plugin ", "marketplace ")))
-    bulk = sorted(g for g in groups if g.startswith(("plugin ", "marketplace ")))
+    bulk = sorted(g for g in groups if g.startswith(("plugin ", "marketplace ")) and g not in refresh)
 
     def tally_s(items):
         t = {"changed": 0, "added": 0, "removed": 0}
@@ -1305,6 +1558,14 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
         return ", ".join(f"{v} {k}" for k, v in t.items() if v) + f" [{worst}]"
 
     lines: list[str] = []
+    # Claude Opus 5.5, 2026-11-23: one line per marketplace refresh. The wording claims what was
+    # checked (the recorded source string) and says the contents were not.
+    for g in refresh:
+        t = {"changed": 0, "added": 0, "removed": 0}
+        for i in groups[g]:
+            t[i["kind"]] += 1
+        lines.append(f"  {g}: " + ", ".join(f"{v} {k}" for k, v in t.items())
+                     + " - review-soon (recorded source unchanged; contents unverified; signature scan clean)")
     for g in plain:
         lines.append(f"  {g}: {tally_s(groups[g])}")
         for it in groups[g][:limit]:
@@ -1330,8 +1591,17 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
     return out[:max_lines]
 
 
-def auto_line(n: int) -> str:
-    return f"agent-integrity: auto-accepted {n} official-marketplace file(s) on provenance + clean signature scan (E8)"
+def is_refresh_group(g: str) -> bool:
+    return g.startswith("marketplace refresh ")
+
+
+def extra_lines(res: Result) -> list[str]:
+    # Claude Opus 5.5, 2026-11-22: the ignore_paths count is printed on every run, clean or not, so a
+    # skip is never silent.
+    out = []
+    if res.ignored:
+        out.append(f"agent-integrity: ignored {res.ignored} path(s) under ignore_paths (config; [] hashes them)")
+    return out
 
 
 def sarif(res: Result, findings: list[dict] | None = None) -> dict:
@@ -1368,6 +1638,9 @@ def sarif(res: Result, findings: list[dict] | None = None) -> dict:
             rule(rid, SIG_DESC[s])
             add(rid, "error" if s in HIGH else "warning", f"{SIG_DESC[s]} ({f['key']})",
                 file_uri(f["key"]), f.get("sha"))
+    for x in res.links:
+        rule("agent-integrity/link-unwatched", "A symlink in a watched root could not be fully followed.")
+        add("agent-integrity/link-unwatched", "error", f"{x['key']}: {x['reason']}", file_uri(x["key"]))
     if res.status == "untrusted":
         rule("agent-integrity/manifest-untrusted", "The signed manifest failed verification or was rolled back.")
         add("agent-integrity/manifest-untrusted", "error", res.reason)
@@ -1407,8 +1680,11 @@ def emit(res: Result, fmt: str, args, findings=None) -> None:
 # --- Commands ------------------------------------------------------------------------------
 def make_ctx(args, store: Store | None = None, manifest: dict | None = None) -> Ctx:
     home = Path(args.home) if args.home else Path.home()
-    projects = args.project or (manifest or {}).get("projects") or [os.getcwd()]
-    return Ctx(home, [Path(p) for p in projects])
+    cfg = store.config() if store else {}
+    # Claude Opus 5.5, 2026-11-23: config `projects` now counts here too, as it does in `check`; prior
+    # code fell back to the working directory, so a baseline could miss a configured project.
+    projects = args.project or (manifest or {}).get("projects") or cfg.get("projects") or [os.getcwd()]
+    return Ctx(home, [Path(p) for p in projects], cfg)
 
 
 def cmd_check(args) -> int:
@@ -1477,11 +1753,11 @@ def cmd_status(args) -> int:
 
 def cmd_scan(args) -> int:
     store = Store(args.store)
-    ctx = make_ctx(args)
+    ctx = make_ctx(args, store)
     allow = store.allow()
     findings = []
     for _a, p in surface_files(ctx, args.tier):
-        if p.resolve() == SELF or p.is_symlink():
+        if p.resolve() == SELF or not p.is_file():
             continue
         hits = sig_hits(p, args.severity == "high")
         if not hits:
@@ -1513,7 +1789,7 @@ def cmd_scan(args) -> int:
 def cmd_baseline(args) -> int:
     store = Store(args.store)
     pend = Path(args.pending_dir)
-    ctx = make_ctx(args)
+    ctx = make_ctx(args, store)
     try:
         prev, _ = load_trusted_manifest(store)
     except Untrusted:
@@ -1529,7 +1805,7 @@ def cmd_baseline(args) -> int:
         if old.get(k) == d:
             continue
         p = ctx.path(k)
-        if not p.is_file() or p.is_symlink():
+        if not p.is_file():      # follows a link; only regular files are read
             continue
         hits = unreviewed_high(p, d, allow, reviewed)
         if hits:
@@ -1561,6 +1837,10 @@ def cmd_baseline(args) -> int:
     if sigf.exists():
         sigf.unlink()   # a stale signature must never sit beside a different manifest
     print(f"baselined {len(new)} files -> PENDING {out} (seq {seq}); not trusted until signed.")
+    if ctx.ignored:
+        print(f"ignored {ctx.ignored} path(s) under ignore_paths (config; [] hashes them)")
+    for x in ctx.links:      # Claude Opus 5.5, 2026-11-22: a baseline never hides a partly watched link
+        print(f"WARNING: LINK {x['key']} -> {x['target']}: {x['reason']}; `check` reports it on every run")
     print(f"Next: python3 {SELF.name} sign --key <your private key>")
     return EXIT_CLEAN
 
@@ -1568,7 +1848,8 @@ def cmd_baseline(args) -> int:
 def views_now(res: Result, store: Store, user: Path, events: list[dict], now: float, cfg: dict) -> dict:
     skip = {i["key"] for i in res.items if item_rank(i) >= 2}     # already shouted about as themselves
     return make_views(events, now, current_state(res, store, user), snapshot_index(store.root, user),
-                      signed_state(store), res.tier, cfg, skip)
+                      signed_state(store), res.tier, cfg, skip,
+                      vendor=res._rules)
 
 def write_weekly_copy(res: Result, store: Store, tdir: Path, now: float, cfg: dict, user: Path | None = None) -> None:
     """reports/YYYY-Www.html: a dated copy of the dashboard, refreshed at most once a day."""
@@ -2097,6 +2378,8 @@ def bulk_digest(items: list[dict]) -> str:
 
 
 def is_bulk_item(it: dict) -> bool:
+    if it.get("class") == REFRESH_CLASS and not it.get("sigs"):
+        return True                         # one trail event per marketplace refresh, not per file
     return not it.get("lines") and is_plugin_key(it["key"]) and not config_type(it["key"])
 
 
@@ -2126,19 +2409,10 @@ def record_changes(res: "Result", tr: Trail, now: float) -> int:
         prev = last.get(g)
         if prev and prev["new_digest"] == dig:
             continue
-        tr.append("bulk", g, now, new_digest=dig, risk="neutral",
+        tr.append("bulk", g, now, new_digest=dig, risk=RANK_LABEL[max(item_rank(i) for i in its)],
                   semantic_lines=[f"{len(its)} plugin file(s) changed in {g}, signature scan clean"],
                   extra={"count": len(its), "keys": [i["key"] for i in its[:200]]})
         n += 1
-    if res._e8:
-        dig = bulk_digest([{"key": k, "digest": d} for k, d in res._e8])
-        prev = last.get("official-marketplace updates")
-        if not prev or prev["new_digest"] != dig:
-            tr.append("bulk", "official-marketplace updates", now, new_digest=dig, risk="neutral",
-                      accepted_by="E8", semantic_lines=[f"{len(res._e8)} official-marketplace plugin file(s) "
-                                                        "updated and auto-accepted (E8)"],
-                      extra={"count": len(res._e8)})
-            n += 1
     return n
 
 
@@ -2302,7 +2576,8 @@ def window_anchor(index: dict[str, Path], days: int, now: float) -> dict:
             "label": f"no snapshot that old yet (history starts when the root check first runs)"}
 
 
-def cumulative_diff(old_files: dict, old_fps: dict, new_files: dict, new_fps: dict, tier: str = "all") -> list[dict]:
+def cumulative_diff(old_files: dict, old_fps: dict, new_files: dict, new_fps: dict, tier: str = "all",
+                    vendor: "Rules | list | None" = None) -> list[dict]:
     """Now vs then, as if nothing had been accepted in between. Same classifier as a live check,
     but there is no file text here, so the signature scan is not part of it."""
     out = []
@@ -2312,6 +2587,7 @@ def cumulative_diff(old_files: dict, old_fps: dict, new_files: dict, new_fps: di
             continue
         kind = "added" if o is None else "removed" if w is None else "changed"
         risk, lines = classify_item(kind, k, [], old_fps.get(k), new_fps.get(k), None)
+        risk, lines, _c = refine_risk(kind, k, [], risk, lines, o or "-", w or "-", vendor)
         out.append({"key": k, "kind": kind, "risk": risk, "lines": lines, "group": group_of(k)})
     out.sort(key=lambda d: (-RISK_RANK[d["risk"]], d["key"]))
     return out
@@ -2369,7 +2645,7 @@ def accepted_by_of(ev: dict, idx: dict) -> str | None:
 
 
 ACCEPT_WORDS = {"R-settle": "accepted automatically after the quiet cool-off (R-settle)",
-                "E8": "accepted automatically: official marketplace update (E8)",
+                "E8": "accepted automatically: official marketplace update (E8, before 0.4.3)",
                 "sign": "accepted when you signed a new baseline", None: "not accepted yet"}
 
 
@@ -2408,7 +2684,8 @@ def anchors_for(events: list[dict], index: dict[str, Path], now: float, signed: 
 
 
 def slow_drift(events: list[dict], now: float, cur: tuple[dict, dict] | None, anchors: list[dict],
-               tier: str = "all", creep_n: int = DEFAULT_CREEP_N, skip_keys: set | frozenset = frozenset()) -> list[dict]:
+               tier: str = "all", creep_n: int = DEFAULT_CREEP_N, skip_keys: set | frozenset = frozenset(),
+               vendor: "Rules | list | None" = None) -> list[dict]:
     """Deterministic. Four ways a series of individually acceptable steps adds up to something that
     would have been refused as one step. Reads only the trail and snapshots; nothing is accepted here."""
     out: list[dict] = []
@@ -2424,7 +2701,7 @@ def slow_drift(events: list[dict], now: float, cur: tuple[dict, dict] | None, an
     if cur:
         seen: set[str] = set()
         for a in anchors:
-            for d in cumulative_diff(a["files"], a["fps"], cur[0], cur[1], tier):
+            for d in cumulative_diff(a["files"], a["fps"], cur[0], cur[1], tier, vendor):
                 if RISK_RANK[d["risk"]] < 2 or d["key"] in skip_keys or d["key"] in seen:
                     continue
                 seen.add(d["key"])
@@ -2529,21 +2806,24 @@ def current_state(res: "Result", store: Store, user: Path) -> tuple[dict, dict] 
 
 
 def make_views(events: list[dict], now: float, cur: tuple[dict, dict] | None, index: dict[str, Path],
-               signed: dict | None, tier: str, cfg: dict, skip_keys: set, as_of: str | None = None) -> dict:
+               signed: dict | None, tier: str, cfg: dict, skip_keys: set, as_of: str | None = None,
+               vendor: "Rules | list | None" = None) -> dict:
     views: dict = {"as_of": as_of, "since_signed": None, "windows": [], "slow": [], "have_state": cur is not None}
     if cur is None:
         return views
     if signed:
         views["since_signed"] = {"label": signed["label"],
-                                 "diffs": cumulative_diff(signed["files"], signed["fps"], cur[0], cur[1], tier)}
+                                 "diffs": cumulative_diff(signed["files"], signed["fps"], cur[0], cur[1], tier, vendor)}
     for w in WINDOWS:
         a = window_anchor(index, w, now)
         diffs = None
         if a["snap"]:
-            diffs = cumulative_diff(a["snap"].get("files", {}), a["snap"].get("fingerprints", {}), cur[0], cur[1], tier)
+            diffs = cumulative_diff(a["snap"].get("files", {}), a["snap"].get("fingerprints", {}), cur[0], cur[1], tier,
+                                    vendor)
         views["windows"].append({"days": w, "label": a["label"], "diffs": diffs})
     creep_n = int(cfg.get("creep_threshold", DEFAULT_CREEP_N) or DEFAULT_CREEP_N)
-    views["slow"] = slow_drift(events, now, cur, anchors_for(events, index, now, signed, tier), tier, creep_n, skip_keys)
+    views["slow"] = slow_drift(events, now, cur, anchors_for(events, index, now, signed, tier), tier, creep_n, skip_keys,
+                               vendor)
     return views
 
 
@@ -2663,7 +2943,7 @@ def cmd_diff(args) -> int:
             print(f"cannot compare with {since} days ago: {a['label']}")
             return EXIT_USAGE
         old, ofps, label = a["snap"].get("files", {}), a["snap"].get("fingerprints", {}), a["label"]
-    diffs = cumulative_diff(old, ofps, new, fps, args.tier)
+    diffs = cumulative_diff(old, ofps, new, fps, args.tier, ctx.rules(manifest.get("marketplaces", {})))
     print(f"Changes between {label} and now (every accepted step counted, nothing hidden):")
     for ln in describe_diff(diffs):
         print(ln)
@@ -2730,7 +3010,8 @@ def as_of_view(store: Store, user: Path, cfg: dict, tier: str, day: str):
         signed = {"label": f"the oldest recorded snapshot ({first}); no signed copy was kept for that day",
                   "files": s0.get("files", {}), "fps": s0.get("fingerprints", {}), "seq": s0.get("seq")}
     skip = {i["key"] for i in res.items if item_rank(i) >= 2}
-    views = make_views(events, end - 1, (files, fps), index, signed, tier, cfg, skip, as_of=day)
+    views = make_views(events, end - 1, (files, fps), index, signed, tier, cfg, skip, as_of=day,
+                       vendor=res._rules)
     sign_ts = max((e["ts"] for e in idx["signs"]), default=0)
     accepted = {e["key"]: {"rule": "R-settle", "ts": local_day(e["ts"])} for e in events
                 if e["kind"] == "settled" and e["ts"] > sign_ts}
@@ -2747,6 +3028,9 @@ def plan_alerts(res: Result, state: dict, now: float) -> tuple[list[dict], dict]
     cleared), and one batched daily note for review-soon. Pure: state in, state out."""
     out: list[dict] = []
     raising = {f"{i['key']}|{i.get('digest')}": i for i in res.items if item_rank(i) >= 2}
+    for x in res.links:      # Claude Opus 5.5, 2026-11-22: a link that is not fully watched pages once
+        raising[f"link|{x['key']}|{x['reason']}"] = {"key": x["key"], "kind": "link",
+                                                     "lines": [f"{x['key']}: {x['reason']}"]}
     sent = set(state.get("raising", []))
     fresh = [k for k in raising if k not in sent]
     if fresh:
@@ -2768,7 +3052,10 @@ def plan_alerts(res: Result, state: dict, now: float) -> tuple[list[dict], dict]
             out.append({"level": "red" if s_ != "stale" else "grey",
                         "title": f"agent-integrity: {s_.upper()}",
                         "body": res.reason or res.stale_why or s_, "ids": [s_]})
-    review = {f"{i['key']}|{i.get('digest')}" for i in res.items if item_rank(i) == 1}
+    # Claude Opus 5.5, 2026-11-22: the vendor-sync and marketplace-refresh classes are listed in every
+    # report but never page.
+    review = {f"{i['key']}|{i.get('digest')}" for i in res.items
+              if item_rank(i) == 1 and i.get("class") not in QUIET_CLASSES}
     rv = state.get("review", {}) if isinstance(state.get("review"), dict) else {}
     rv_ids = set(rv.get("ids", [])) & review
     rv_day = rv.get("day", "")
@@ -2876,7 +3163,7 @@ def banner_of(res: Result) -> tuple[str, str, str]:
     if res.status == "clean":
         return "green", "Clean", "Every watched file matches the signed baseline."
     if w >= 2:
-        n = sum(1 for i in res.items if item_rank(i) >= 2)
+        n = sum(1 for i in res.items if item_rank(i) >= 2) + len(res.links)
         return "red", f"{n} change(s) raise risk: review needed", "These are never auto-accepted."
     if w == 1:
         n = sum(1 for i in res.items if item_rank(i) == 1)
@@ -3000,9 +3287,6 @@ def render_html(res: Result, hist: list[dict], accepted: dict, now: float, views
     # Auto-accepted
     p.append("<h2>Auto-accepted</h2>")
     settled = {k: v for k, v in accepted.items() if isinstance(v, dict) and v.get("rule") == "R-settle"}
-    p.append(f"<details><summary>E8 official-marketplace updates this run: {res.auto_accepted}</summary>"
-             "<p>Accepted on provenance from the signed manifest plus a clean signature scan. "
-             "Not listed per file.</p></details>")
     p.append(f"<details><summary>R-settle neutral changes accepted after the cool-off: {len(settled)}</summary><ul>"
              + "".join(f"<li><code>{e(k)}</code> at {e(str(v.get('ts', '')))}</li>" for k, v in sorted(settled.items())[:100])
              + "</ul></details>")
@@ -3247,7 +3531,7 @@ def key_is_watched(ctx: Ctx, key: str) -> bool:
                 return True
             if s["kind"] == "file" and fnmatch.fnmatchcase(path, pat):
                 return True
-    return False
+    return any(path == w or path.startswith(w + os.sep) for w in ctx.watch)
 
 
 def cmd_quarantine(args) -> int:

@@ -77,7 +77,7 @@ forgotten.
 
 - **`events.jsonl`** sits next to the overlay. One line for every change the tool observed (once per
   new contents), plus one for each `sign` and each auto-accept. Each line carries the plain-English
-  change, its risk, who accepted it (`E8` official-marketplace update, `R-settle`, `sign`, or nobody
+  change, its risk, who accepted it (`R-settle`, `sign`, `E8` on events from before 0.4.3, or nobody
   yet), and `prev_hash` / `hash`, so the file is an append-only chain: `hash = sha256(prev_hash +
   canonical JSON of the line)`. Writer: the root job in protected mode; the user folder in
   unprotected mode, and every output says which.
@@ -178,6 +178,36 @@ are not hashed; others, such as a Homebrew python, are. A program that reads a d
 list (a config, a queue) is only as safe as that file. The gate protects the job's definition, not the
 data it works on.
 
+## Links, marketplace refreshes, ignore list, vendor-sync, watch_paths (0.4.3)
+
+- **Symlinks are followed.** A link inside a watched root is recorded (as written and resolved) and, for
+  a directory, its files are hashed and scanned under the link path. A retargeted link is `raising`.
+  Cycles stop; nesting is capped at 8; `link_max_files` (default 2000) caps files per link. A link over
+  a cap is reported on every run.
+- **Marketplace refresh.** Drift under a plugin marketplace the signed manifest recorded, with the same
+  source today, is one line per marketplace (changed, added, removed) at review-soon, marked "contents
+  unverified". It is not accepted and does not alert. The source check proves a name and a string in
+  local JSON, not the bytes, so nothing is accepted on it. A signature hit there is still a threat; an
+  unrecorded marketplace or a changed source is classified as an ordinary plugin change.
+- **Store `config.json` keys** (the user-dir config cannot set these):
+
+  ```json
+  {"ignore_paths": ["~/.claude/plugins/.trash"],
+   "vendor_sync_paths": ["~/.claude/skills/synced"],
+   "link_max_files": 2000,
+   "watch_paths": ["/opt/agent-gates", "/etc/agent/policy.toml"],
+   "projects": ["~/code/app"]}
+  ```
+
+  `ignore_paths` are never hashed; each report prints how many files that skipped. `[]` hashes them.
+  `vendor_sync_paths` drift is listed every run at review-soon and never alerts; a high-severity
+  signature hit there is still a threat. `watch_paths` takes absolute paths outside the built-in
+  surfaces; every file there is hashed and scanned and drift is raising. `baseline` and `check` both
+  read `projects` and `watch_paths`.
+  Set them at install time: `sudo ./install-root.sh ... --project DIR --watch-path PATH` (both
+  repeatable). The installer rewrites `config.json` from its flags on every run, so pass them all
+  each time.
+
 ## Explanation clarity benchmark (`bench/`)
 
 `bench/run.py --model gpt-oss:20b` runs the real explainer prompt on 15 realistic changes against a
@@ -210,9 +240,11 @@ Read this before you rely on it.
 - **Signatures are regular expressions.** They catch the common shapes and are trivially evaded by an
   attacker who knows them (split strings, indirection, a different language). They are a tripwire for
   new behaviour, not a malware scanner.
-- **Provenance is narrow.** Plugin updates are auto-accepted only when the signed manifest
-  recorded the marketplace, its source is unchanged and matches an official prefix
-  (default `anthropics/`), and the changed files have no high-severity hit. Anything else is shown.
+- **Nothing is accepted on provenance.** The signed manifest records each marketplace's source
+  string, and a matching string today only moves that marketplace's drift into the quiet
+  marketplace-refresh class. Local JSON can be rewritten by anything running as the user, so the
+  string is a grouping hint, not proof. Accepting is `sign` or the R-settle cool-off for neutral
+  changes.
 
 ### What it does not cover
 
