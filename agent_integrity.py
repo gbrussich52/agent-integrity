@@ -53,13 +53,13 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 try:                       # advisory file locking for the audit log; absent on non-POSIX
     import fcntl
@@ -126,6 +126,20 @@ DEFAULT_IGNORE_PATHS = ["~/.claude/plugins/.trash"]
 # signature hit there is still a threat.
 DEFAULT_VENDOR_SYNC_PATHS = ["~/.claude/skills/synced"]
 VENDOR_CLASS = "vendor-sync"
+# Claude Opus 5.5, 2026-11-23: drift under a plugin marketplace the signed manifest recorded, from the
+# source it still names today. That proves the name and the source string, not the bytes, so the
+# class is listed at review-soon (one line per marketplace), never paged and never accepted. It
+# replaces the 0.4.2 official-marketplace auto-accept (E8), which checked the same strings and
+# accepted on them.
+REFRESH_CLASS = "marketplace-refresh"
+QUIET_CLASSES = {VENDOR_CLASS, REFRESH_CLASS}
+
+
+class Rules(NamedTuple):
+    """Path classes refine_risk applies, in key form (~/... or absolute)."""
+    vendor: list = list(DEFAULT_VENDOR_SYNC_PATHS)
+    refresh: frozenset = frozenset()       # marketplace names that qualify as a refresh this run
+    watch: list = []                       # watch_paths: drift there is raising
 # A symlink inside a watched root is recorded and followed. Caps keep one link to a huge tree from
 # stalling the hourly run; hitting one is a finding on every run, never a silent skip.
 DEFAULT_LINK_MAX_FILES = 2000
@@ -170,9 +184,6 @@ SIG_DESC = {
     "hidden-unicode": "Contains invisible or bidirectional-control unicode.",
 }
 
-# Marketplaces whose plugin updates may be auto-accepted: only when the SIGNED manifest
-# recorded the marketplace with a source matching one of these prefixes (or a config override).
-DEFAULT_OFFICIAL_SOURCES = ["anthropics/", "github.com/anthropics/", "https://github.com/anthropics/"]
 DEFAULT_STALE_AFTER = 3 * 3600   # root check runs hourly; three missed runs = stale
 MAX_SCAN_BYTES = 2 * 1024 * 1024
 
@@ -276,6 +287,9 @@ class Ctx:
             self.link_cap = max(1, int(cfg.get("link_max_files", DEFAULT_LINK_MAX_FILES)))
         except (TypeError, ValueError):
             self.link_cap = DEFAULT_LINK_MAX_FILES
+        # Claude Opus 5.5, 2026-11-23: watch_paths = absolute dirs or files outside the built-in
+        # surfaces (a gates dir, a shared script). Every file there is hashed and scanned.
+        self.watch = [w for w in (self.expand(x) for x in _path_list(cfg, "watch_paths", [])) if os.path.isabs(w)]
         self.ignored = 0                    # files skipped by ignore_paths in the last walk
         self.links: list[dict] = []         # link findings (over cap, too deep) from the last walk
 
@@ -288,6 +302,10 @@ class Ctx:
 
     def vendor_keys(self) -> list[str]:
         return [self.key(Path(d)) for d in self.vendor]
+
+    def rules(self, signed_mp: dict | None = None) -> Rules:
+        return Rules(self.vendor_keys(), refresh_set(signed_mp or {}, marketplace_sources(self.home)),
+                     [self.key(Path(w)) for w in self.watch])
 
     def key(self, p: Path) -> str:
         s = str(p)
@@ -349,8 +367,8 @@ def link_change(old: str, new: str) -> str | None:
     return None
 
 
-def _codeish(p: Path) -> bool:
-    return p.suffix.lower() in CODEISH or p.parent.name in {"hooks", "gates"}
+def _codeish(p: Path, every: bool = False) -> bool:
+    return every or p.suffix.lower() in CODEISH or p.parent.name in {"hooks", "gates"}
 
 
 def _count_ignored(root: Path) -> int:
@@ -362,7 +380,8 @@ def _count_ignored(root: Path) -> int:
     return n
 
 
-def _walk(root: Path, ctx: Ctx | None = None, chain: tuple = (), depth: int = 0, budget: dict | None = None):
+def _walk(root: Path, ctx: Ctx | None = None, chain: tuple = (), depth: int = 0, budget: dict | None = None,
+          every: bool = False):
     """Watched files below root. A symlink is yielded itself (its digest records the target), and a
     link to a directory is then walked too, keyed under the link path. Cycles stop on the chain of
     real directories already being walked; depth and per-link file caps become findings."""
@@ -387,7 +406,7 @@ def _walk(root: Path, ctx: Ctx | None = None, chain: tuple = (), depth: int = 0,
                 if not _take(budget):
                     return
                 yield p
-                yield from _follow(p, ctx, chain, depth, budget)
+                yield from _follow(p, ctx, chain, depth, budget, every)
                 if budget and budget["over"]:
                     return
         for name in sorted(filenames):
@@ -397,9 +416,9 @@ def _walk(root: Path, ctx: Ctx | None = None, chain: tuple = (), depth: int = 0,
             if EPHEMERAL_PLUGIN_CLONE_RE.search(str(p)):
                 continue
             if ctx.is_ignored(p):
-                ctx.ignored += 1 if (p.is_symlink() or _codeish(p)) else 0
+                ctx.ignored += 1 if (p.is_symlink() or _codeish(p, every)) else 0
                 continue
-            if p.is_symlink() or _codeish(p):
+            if p.is_symlink() or _codeish(p, every):
                 if not _take(budget):
                     return
                 yield p
@@ -415,7 +434,7 @@ def _take(budget: dict | None) -> bool:
     return True
 
 
-def _follow(link: Path, ctx: Ctx, chain: tuple, depth: int, budget: dict | None):
+def _follow(link: Path, ctx: Ctx, chain: tuple, depth: int, budget: dict | None, every: bool = False):
     real = os.path.realpath(link)
     if not os.path.isdir(real):
         return                               # a file link: its digest already carries the content hash
@@ -429,7 +448,7 @@ def _follow(link: Path, ctx: Ctx, chain: tuple, depth: int, budget: dict | None)
     own = budget is None
     if own:
         budget = {"n": 0, "cap": ctx.link_cap, "over": False}
-    yield from _walk(link, ctx, chain, depth + 1, budget)
+    yield from _walk(link, ctx, chain, depth + 1, budget, every)
     if own and budget["over"]:
         ctx.links.append({"key": ctx.key(link), "target": real,
                           "reason": f"more than {ctx.link_cap} files behind this link (link_max_files cap); "
@@ -459,12 +478,25 @@ def surface_files(ctx: Ctx, tier: str):
                 if p not in seen:
                     seen.add(p)
                     yield s["agent"], p
+    if tier in ("all", "1"):
+        for w in ctx.watch:
+            root = Path(w)
+            if root.is_symlink():
+                cands = _root_link(root, ctx, every=True)
+            elif root.is_dir():
+                cands = _walk(root, ctx, every=True)
+            else:
+                cands = [root] if root.is_file() else []
+            for p in cands:
+                if p not in seen:
+                    seen.add(p)
+                    yield "watch-path", p
 
 
-def _root_link(root: Path, ctx: Ctx):
+def _root_link(root: Path, ctx: Ctx, every: bool = False):
     """A watched directory that is itself a link: record it, then walk its target."""
     yield root
-    yield from _follow(root, ctx, (), 0, None)
+    yield from _follow(root, ctx, (), 0, None, every)
 
 
 def mcp_entries(ctx: Ctx, tier: str) -> dict[str, str]:
@@ -649,133 +681,9 @@ def marketplace_sources(home: Path) -> dict[str, str]:
     return out
 
 
-def is_official(source: str, official: list[str]) -> bool:
-    return bool(source) and any(source.startswith(p) for p in official)
-
-
-# --- Marketplace git clones (E9) -------------------------------------------------------------
-# Claude Opus 5.5, 2026-11-22: git is run against a directory an attacker running as the user can
-# write, possibly by the root daemon. Repo-local config can name programs git runs (fsmonitor,
-# filters, includes, ...), so the config is vetted against an allowlist before git is called, git
-# gets a scrubbed environment, no global or system config, an argument list and a timeout.
-GIT_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin")
-GIT_TIMEOUT = 20
-_GIT_SAFE_KEYS = {
-    "core": {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
-             "precomposeunicode", "symlinks", "autocrlf", "eol", "safecrlf", "checkstat", "trustctime",
-             "abbrev", "quotepath", "compression", "loosecompression", "packedgitlimit",
-             "packedgitwindowsize", "commitgraph", "multipackindex", "untrackedcache", "splitindex"},
-    "remote": {"url", "fetch", "tagopt", "prune", "prunetags", "promisor", "partialclonefilter", "mirror"},
-    "branch": {"remote", "merge", "rebase"},
-    "extensions": {"objectformat", "partialclone", "refstorage"},
-    "pack": {"packsizelimit", "threads", "window", "depth"},
-    "gc": {"auto", "autopacklimit", "autodetach", "reflogexpire", "reflogexpireunreachable"},
-    "index": {"version", "skiphash", "threads"},
-    "fetch": {"prune", "prunetags", "writecommitgraph", "recursesubmodules"},
-    "maintenance": {"auto", "strategy"},
-}
-_GIT_SECTION_RX = re.compile(r'^\s*\[\s*([A-Za-z0-9.-]+)(?:\s+"(?:[^"\\]|\\.)*")?\s*\]\s*(.*)$')
-_GIT_KEY_RX = re.compile(r"^\s*([A-Za-z][A-Za-z0-9-]*)\s*(?:=|$)")
-
-
-def git_bin() -> str | None:
-    for d in GIT_DIRS:
-        c = os.path.join(d, "git")
-        if os.access(c, os.X_OK):
-            return c
-    return None
-
-
-def norm_remote(s: str) -> str:
-    """One spelling per remote: 'owner/name', https and scp-style GitHub URLs compare equal."""
-    s = str(s or "").strip()
-    m = re.match(r"^[\w.-]+@([^:/\s]+):(.+)$", s)
-    if m:
-        host, path = m.group(1), m.group(2)
-    elif "://" in s:
-        u = urlparse(s)
-        host, path = ("file" if u.scheme == "file" else (u.hostname or "")), u.path
-    elif re.match(r"^[\w.-]+/[\w.-]+$", s):
-        host, path = "github.com", s
-    else:
-        host, path = "", s
-    path = path.strip("/").removesuffix(".git").rstrip("/")
-    host = host.lower()
-    if host == "github.com":
-        path = path.lower()
-    return f"{host}/{path}"
-
-
-def unsafe_git_config(text: str) -> str | None:
-    """None when every section and key is on the allowlist, else what is not."""
-    sec = ""
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line[0] in "#;":
-            continue
-        m = _GIT_SECTION_RX.match(line)
-        if m:
-            sec = m.group(1).lower()
-            if sec not in _GIT_SAFE_KEYS or ("\"" in line and sec not in ("remote", "branch")):
-                return f"config section [{sec}]"
-            line = m.group(2).strip()
-            if not line:
-                continue
-        k = _GIT_KEY_RX.match(line)
-        if not k or not sec or k.group(1).lower() not in _GIT_SAFE_KEYS[sec]:
-            return f"config key {sec}.{k.group(1) if k else line[:40]}"
-    return None
-
-
-def clone_verdict(clone: Path, source: str) -> tuple[bool, str]:
-    """(accept?, reason). Accept only a clean clone whose origin is the recorded source and whose
-    HEAD is on a remote-tracking ref of origin. Every doubt is a refusal with its reason."""
-    gd = clone / ".git"
-    if clone.is_symlink() or not clone.is_dir():
-        return False, "the marketplace directory is a link or missing"
-    if gd.is_symlink() or not gd.is_dir():
-        return False, "not a git clone (no .git directory)"
-    for extra in ("config.worktree", "commondir"):
-        if (gd / extra).exists():
-            return False, f".git/{extra} present"
-    try:
-        bad = unsafe_git_config((gd / "config").read_text(errors="replace"))
-    except OSError:
-        return False, "cannot read .git/config"
-    if bad:
-        return False, f"clone git config is not plain ({bad})"
-    git = git_bin()
-    if not git:
-        return False, "git not found"
-    with tempfile.TemporaryDirectory(prefix="ai-git-") as h:
-        env = {"PATH": DEFAULT_JOB_PATH, "HOME": h, "XDG_CONFIG_HOME": h, "LC_ALL": "C",
-               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
-        base = [git, "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
-                "-c", "core.untrackedCache=false", "-c", f"safe.directory={clone}", "-C", str(clone)]
-
-        def run(*a: str) -> tuple[int, str]:
-            try:
-                r = subprocess.run([*base, *a], capture_output=True, text=True, timeout=GIT_TIMEOUT,
-                                   env=env, stdin=subprocess.DEVNULL)
-            except (OSError, subprocess.SubprocessError) as e:
-                return -1, str(e)
-            return r.returncode, r.stdout
-
-        rc, out = run("config", "--local", "--get-all", "remote.origin.url")
-        urls = [u for u in out.splitlines() if u.strip()]
-        if rc != 0 or len(urls) != 1:
-            return False, "origin remote missing or ambiguous"
-        if norm_remote(urls[0]) != norm_remote(source):
-            return False, f"origin {clean_text(urls[0], 120)} does not match the recorded source {clean_text(source, 120)}"
-        rc, out = run("status", "--porcelain", "-z", "--untracked-files=all")
-        if rc != 0:
-            return False, "git status failed"
-        if out.strip("\0"):
-            return False, "working tree has local changes or untracked files"
-        rc, out = run("rev-list", "-n", "1", "HEAD", "--not", "--remotes=origin")
-        if rc != 0 or out.strip():
-            return False, "HEAD is not on a commit fetched from origin"
-    return True, "clean clone of the recorded remote"
+def refresh_set(signed_mp: dict, live_mp: dict) -> frozenset:
+    """Marketplaces the signed manifest recorded whose source string is the same today."""
+    return frozenset(mp for mp, src in signed_mp.items() if src and live_mp.get(mp) == src)
 
 
 # --- Semantic config diff ------------------------------------------------------------------
@@ -1165,22 +1073,48 @@ def classify_item(kind: str, key: str, sigs: list, old_fp, new_fp, size_new: int
 
 
 # --- Result model --------------------------------------------------------------------------
+def class_group(cls: str, k: str) -> str:
+    return f"marketplace refresh {marketplace_of(k)}" if cls == REFRESH_CLASS else cls
+
+
 def is_vendor_key(k: str, prefixes: list[str]) -> bool:
     return any(k == p.rstrip("/") or k.startswith(p.rstrip("/") + "/") for p in prefixes)
 
 
+def as_rules(r) -> Rules:
+    return r if isinstance(r, Rules) else Rules() if r is None else Rules(vendor=list(r))
+
+
+def item_class(k: str, rules: Rules) -> str | None:
+    if is_vendor_key(k, rules.vendor):
+        return VENDOR_CLASS
+    if is_plugin_key(k) and marketplace_of(k) in rules.refresh:
+        return REFRESH_CLASS
+    return None
+
+
 def refine_risk(kind: str, k: str, sigs: list, risk: str, lines: list, old_d: str, new_d: str,
-                vendor: list[str]) -> tuple[str, list, str | None]:
-    """(risk, lines, class) after the link and vendor-sync rules. A signature hit always wins."""
+                rules) -> tuple[str, list, str | None]:
+    """(risk, lines, class) after the link, watch_paths and class rules. A signature hit always wins."""
+    rules = as_rules(rules)
     # Claude Opus 5.5, 2026-11-22: retargeting a link (or swapping a file for one) is an attack shape,
     # so it is raising at least, wherever it is. Vendor-synced drift is listed at review-soon on every
     # run and never pages, because its provenance cannot be proven locally.
-    cls = VENDOR_CLASS if is_vendor_key(k, vendor) else None
+    cls = item_class(k, rules)
     if sigs:
         return risk, lines, cls
     relink = link_change(old_d, new_d)
     if relink:
         return ("raising" if RISK_RANK[risk] < 2 else risk), [f"{short_name(k)}: {relink} - raising"] + lines, cls
+    if is_vendor_key(k, rules.watch):
+        # Claude Opus 5.5, 2026-11-23: a path the owner named in watch_paths is one they load or run.
+        if RISK_RANK[risk] >= 2:
+            return risk, lines, cls
+        return "raising", [f"{short_name(k)}: file under watch_paths {kind} - raising"], cls
+    if cls == REFRESH_CLASS:
+        return "review-soon", [f"{short_name(k)}: file {kind} in a marketplace refresh ({marketplace_of(k)}); "
+                               "recorded source unchanged, contents unverified, signature scan clean "
+                               "- review-soon (marketplace-refresh)"], cls
     if cls:
         return "review-soon", [f"{short_name(k)}: vendor-synced file {kind}; provenance cannot be checked "
                                "locally, signature scan clean - review-soon (vendor-sync)"], cls
@@ -1200,7 +1134,6 @@ class Result:
         self.seq: int | None = None
         # {kind, key, group, sigs, digest, risk, final_risk, lines, [llm]}
         self.items: list[dict] = []
-        self.auto_accepted = 0             # E8 (official marketplace), this run
         self.settled = 0                   # R-settle, this run
         self.scanned = 0
         self.notes: list[str] = []
@@ -1212,17 +1145,15 @@ class Result:
         # Scheduled jobs that differ from the signed loops manifest: {label, state, changes, enforce, action}
         self.loops: list[dict] = []
         # Claude Opus 5.5, 2026-11-22: links that could not be fully watched (over cap, too deep),
-        # files accepted as a clean marketplace git clone (E9), files skipped by ignore_paths.
+        # and files skipped by ignore_paths.
         self.links: list[dict] = []
-        self.clone_accepted = 0
         self.ignored = 0
-        self._e9: list[tuple] = []
+        self._rules: Rules = Rules()
         # Transient run state for the audit trail; never serialized.
         self.settled_items: list[dict] = []
         self._ctx = None
         self._new: dict = {}
         self._old_fp: dict = {}
-        self._e8: list[tuple] = []
         self._cur = None
 
     def counts(self) -> dict:
@@ -1250,11 +1181,11 @@ class Result:
         return {"tool": "agent-integrity", "version": VERSION, "command": self.command, "tier": self.tier,
                 "status": self.status, "exit": self.exit, "reason": self.reason, "seq": self.seq,
                 "scanned": self.scanned, "counts": self.counts(), "mode": self.mode,
-                "auto_accepted": self.auto_accepted, "settled": self.settled, "risk": self.risk_tally(),
+                "settled": self.settled, "risk": self.risk_tally(),
                 "settling": self.settling[:50], "notes": self.notes, "stale_why": self.stale_why,
                 "truncated": cap is not None and len(self.items) > cap, "items": items,
                 "loops": self.loops[:200], "links": self.links[:200],
-                "clone_accepted": self.clone_accepted, "ignored": self.ignored}
+                "ignored": self.ignored}
 
     @classmethod
     def from_json(cls, d: dict) -> "Result":
@@ -1265,13 +1196,13 @@ class Result:
         for i in r.items:
             i.setdefault("sigs", [])
             i.setdefault("group", group_of(i["key"]))
-        r.auto_accepted, r.settled = int(d.get("auto_accepted", 0)), int(d.get("settled", 0))
+        r.settled = int(d.get("settled", 0))
         r.scanned, r.notes = int(d.get("scanned", 0)), list(d.get("notes", []))
         r.mode, r.stale_why = str(d.get("mode", "unprotected")), str(d.get("stale_why", ""))
         r.settling, r.truncated = list(d.get("settling", [])), bool(d.get("truncated"))
         r.loops = [x for x in d.get("loops", []) if isinstance(x, dict) and "label" in x]
         r.links = [x for x in d.get("links", []) if isinstance(x, dict) and "key" in x and "reason" in x]
-        r.clone_accepted, r.ignored = int(d.get("clone_accepted", 0)), int(d.get("ignored", 0))
+        r.ignored = int(d.get("ignored", 0))
         return r
 
 
@@ -1476,16 +1407,10 @@ def run_check(args, store: Store, user: Path | None = None) -> Result:
     if args.allow:
         allow.update(load_json(Path(args.allow)))
 
-    official = cfg.get("official_sources") or DEFAULT_OFFICIAL_SOURCES
-    signed_mp = manifest.get("marketplaces", {})
-    live_mp = marketplace_sources(ctx.home)
-
-    def trusted_marketplace(k: str) -> bool:
-        mp = marketplace_of(k)
-        # Provenance = the SIGNED manifest recorded this marketplace, from an official source,
-        # and its source today is the same. A marketplace added after signing never qualifies.
-        return bool(mp) and signed_mp.get(mp) is not None and signed_mp[mp] == live_mp.get(mp) \
-            and is_official(signed_mp[mp], official)
+    # Claude Opus 5.5, 2026-11-23: no file is accepted on provenance any more. A marketplace the
+    # signed manifest recorded, with the same source today, puts its drift in the refresh class.
+    rules = ctx.rules(manifest.get("marketplaces", {}))
+    res._rules = rules
 
     def sigs_for(k: str) -> list[str]:
         p = ctx.path(k)
@@ -1494,49 +1419,16 @@ def run_check(args, store: Store, user: Path | None = None) -> Result:
 
     cfg_keys = [k for kk in (changed, added) for k in kk if config_type(k)]
     res.fps = config_fingerprints(ctx, cfg_keys)
-    clones: dict[str, tuple[bool, str]] = {}
-    vkeys = ctx.vendor_keys()
-
-    def clean_clone(k: str) -> bool:
-        # Claude Opus 5.5, 2026-11-22: E9. A marketplace clone refreshed from upstream is accepted
-        # only when the signed manifest recorded the marketplace, its source is unchanged, and git
-        # proves the clone equals a commit from that remote. Prior code showed every refresh of a
-        # non-official marketplace as hundreds of drift items.
-        m = _MARKET_RE.match(k)
-        if not m:
-            return False
-        mp = m.group(1)
-        if mp not in clones:
-            src = signed_mp.get(mp)
-            if not src or src != live_mp.get(mp):
-                clones[mp] = (False, "the marketplace is not in the signed manifest, or its source changed")
-            else:
-                clones[mp] = clone_verdict(ctx.home / ".claude/plugins/marketplaces" / mp, src)
-            if not clones[mp][0]:
-                res.notes.append(f"marketplace {mp}: clone drift not auto-accepted: {clones[mp][1]}")
-        return clones[mp][0]
-
     for kind, keys in (("changed", changed), ("added", added), ("removed", removed)):
         for k in keys:
             sigs = sigs_for(k) if kind != "removed" else []
-            relink = link_change(old.get(k, "-"), new.get(k, "-"))
-            # Nothing left to scan on removal: provenance alone is the basis. A retargeted link is
-            # never accepted on provenance: pointing a link elsewhere is how a swap would look.
-            if is_plugin_key(k) and not sigs and not relink and trusted_marketplace(k):
-                res.auto_accepted += 1
-                res._e8.append((k, new.get(k, "-")))
-                continue
-            if is_plugin_key(k) and not sigs and not relink and clean_clone(k):
-                res.clone_accepted += 1
-                res._e9.append((k, new.get(k, "-")))
-                continue
             try:
                 size = ctx.path(k).stat().st_size if kind != "removed" and not config_type(k) else None
             except OSError:
                 size = None
             risk, lines = classify_item(kind, k, sigs, old_fp.get(k), res.fps.get(k), size)
-            risk, lines, it_class = refine_risk(kind, k, sigs, risk, lines, old.get(k, "-"), new.get(k, "-"), vkeys)
-            group = VENDOR_CLASS if it_class and not sigs else group_of(k)
+            risk, lines, it_class = refine_risk(kind, k, sigs, risk, lines, old.get(k, "-"), new.get(k, "-"), rules)
+            group = class_group(it_class, k) if it_class and not sigs else group_of(k)
             bulk = is_plugin_key(k) and not config_type(k) and risk == "neutral"
             item = {"kind": kind, "key": k, "group": group, "sigs": sigs,
                     "old": old.get(k, "-"), "digest": new.get(k, "-"), "risk": risk, "final_risk": risk,
@@ -1587,8 +1479,6 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
         out = [f"agent-integrity: clean ({res.scanned} files, tier {res.tier}, manifest seq {res.seq})", ml]
         if res.settled:
             out.append(f"agent-integrity: auto-settled {res.settled} neutral change(s) after the cool-off (R-settle)")
-        if res.auto_accepted:
-            out.insert(0, auto_line(res.auto_accepted))
         out.extend(extra_lines(res))
         return out
     c = res.counts()
@@ -1601,8 +1491,6 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
     tally = res.risk_tally()
     if tally:
         out.append("risk: " + ", ".join(f"{tally[l]} {l}" for l in ("threat", "raising", "review-soon", "neutral") if l in tally))
-    if res.auto_accepted:
-        out.append(auto_line(res.auto_accepted))
     if res.settled:
         out.append(f"agent-integrity: auto-settled {res.settled} neutral change(s) after the cool-off (R-settle)")
     out.extend(extra_lines(res))
@@ -1619,7 +1507,8 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
         budget -= 1
 
     # Plain-English change lines: config files and anything above neutral, worst first.
-    sem = [it for it in res.items if it.get("lines") and (config_type(it["key"]) or item_rank(it) >= 1)]
+    sem = [it for it in res.items if it.get("lines") and (config_type(it["key"]) or item_rank(it) >= 1)
+           and not is_refresh_group(it["group"])]
     sem.sort(key=lambda i: (-item_rank(i), i["key"]))
     sem_budget = min(max(budget - 4, 0), 8)
     sem_lines: list[str] = []
@@ -1657,8 +1546,9 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
     groups: dict[str, list[dict]] = {}
     for it in res.items:
         groups.setdefault(it["group"], []).append(it)
+    refresh = sorted(g for g in groups if is_refresh_group(g))
     plain = sorted(g for g in groups if not g.startswith(("plugin ", "marketplace ")))
-    bulk = sorted(g for g in groups if g.startswith(("plugin ", "marketplace ")))
+    bulk = sorted(g for g in groups if g.startswith(("plugin ", "marketplace ")) and g not in refresh)
 
     def tally_s(items):
         t = {"changed": 0, "added": 0, "removed": 0}
@@ -1668,6 +1558,14 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
         return ", ".join(f"{v} {k}" for k, v in t.items() if v) + f" [{worst}]"
 
     lines: list[str] = []
+    # Claude Opus 5.5, 2026-11-23: one line per marketplace refresh. The wording claims what was
+    # checked (the recorded source string) and says the contents were not.
+    for g in refresh:
+        t = {"changed": 0, "added": 0, "removed": 0}
+        for i in groups[g]:
+            t[i["kind"]] += 1
+        lines.append(f"  {g}: " + ", ".join(f"{v} {k}" for k, v in t.items())
+                     + " - review-soon (recorded source unchanged; contents unverified; signature scan clean)")
     for g in plain:
         lines.append(f"  {g}: {tally_s(groups[g])}")
         for it in groups[g][:limit]:
@@ -1693,20 +1591,17 @@ def render_text(res: Result, limit: int = 3, max_lines: int = 20) -> list[str]:
     return out[:max_lines]
 
 
+def is_refresh_group(g: str) -> bool:
+    return g.startswith("marketplace refresh ")
+
+
 def extra_lines(res: Result) -> list[str]:
-    # Claude Opus 5.5, 2026-11-22: E9 accepts and the ignore_paths count are printed on every run,
-    # clean or not, so neither an accept nor a skip is ever silent.
+    # Claude Opus 5.5, 2026-11-22: the ignore_paths count is printed on every run, clean or not, so a
+    # skip is never silent.
     out = []
-    if res.clone_accepted:
-        out.append(f"agent-integrity: accepted {res.clone_accepted} marketplace-clone file(s): clean git clone of "
-                   "the recorded remote + clean signature scan (E9)")
     if res.ignored:
         out.append(f"agent-integrity: ignored {res.ignored} path(s) under ignore_paths (config; [] hashes them)")
     return out
-
-
-def auto_line(n: int) -> str:
-    return f"agent-integrity: auto-accepted {n} official-marketplace file(s) on provenance + clean signature scan (E8)"
 
 
 def sarif(res: Result, findings: list[dict] | None = None) -> dict:
@@ -1785,8 +1680,11 @@ def emit(res: Result, fmt: str, args, findings=None) -> None:
 # --- Commands ------------------------------------------------------------------------------
 def make_ctx(args, store: Store | None = None, manifest: dict | None = None) -> Ctx:
     home = Path(args.home) if args.home else Path.home()
-    projects = args.project or (manifest or {}).get("projects") or [os.getcwd()]
-    return Ctx(home, [Path(p) for p in projects], store.config() if store else {})
+    cfg = store.config() if store else {}
+    # Claude Opus 5.5, 2026-11-23: config `projects` now counts here too, as it does in `check`; prior
+    # code fell back to the working directory, so a baseline could miss a configured project.
+    projects = args.project or (manifest or {}).get("projects") or cfg.get("projects") or [os.getcwd()]
+    return Ctx(home, [Path(p) for p in projects], cfg)
 
 
 def cmd_check(args) -> int:
@@ -1951,7 +1849,7 @@ def views_now(res: Result, store: Store, user: Path, events: list[dict], now: fl
     skip = {i["key"] for i in res.items if item_rank(i) >= 2}     # already shouted about as themselves
     return make_views(events, now, current_state(res, store, user), snapshot_index(store.root, user),
                       signed_state(store), res.tier, cfg, skip,
-                      vendor=_path_list(store.config(), "vendor_sync_paths", DEFAULT_VENDOR_SYNC_PATHS))
+                      vendor=res._rules)
 
 def write_weekly_copy(res: Result, store: Store, tdir: Path, now: float, cfg: dict, user: Path | None = None) -> None:
     """reports/YYYY-Www.html: a dated copy of the dashboard, refreshed at most once a day."""
@@ -2480,6 +2378,8 @@ def bulk_digest(items: list[dict]) -> str:
 
 
 def is_bulk_item(it: dict) -> bool:
+    if it.get("class") == REFRESH_CLASS and not it.get("sigs"):
+        return True                         # one trail event per marketplace refresh, not per file
     return not it.get("lines") and is_plugin_key(it["key"]) and not config_type(it["key"])
 
 
@@ -2509,28 +2409,10 @@ def record_changes(res: "Result", tr: Trail, now: float) -> int:
         prev = last.get(g)
         if prev and prev["new_digest"] == dig:
             continue
-        tr.append("bulk", g, now, new_digest=dig, risk="neutral",
+        tr.append("bulk", g, now, new_digest=dig, risk=RANK_LABEL[max(item_rank(i) for i in its)],
                   semantic_lines=[f"{len(its)} plugin file(s) changed in {g}, signature scan clean"],
                   extra={"count": len(its), "keys": [i["key"] for i in its[:200]]})
         n += 1
-    if res._e8:
-        dig = bulk_digest([{"key": k, "digest": d} for k, d in res._e8])
-        prev = last.get("official-marketplace updates")
-        if not prev or prev["new_digest"] != dig:
-            tr.append("bulk", "official-marketplace updates", now, new_digest=dig, risk="neutral",
-                      accepted_by="E8", semantic_lines=[f"{len(res._e8)} official-marketplace plugin file(s) "
-                                                        "updated and auto-accepted (E8)"],
-                      extra={"count": len(res._e8)})
-            n += 1
-    if res._e9:
-        dig = bulk_digest([{"key": k, "digest": d} for k, d in res._e9])
-        prev = last.get("marketplace-clone updates")
-        if not prev or prev["new_digest"] != dig:
-            tr.append("bulk", "marketplace-clone updates", now, new_digest=dig, risk="neutral",
-                      accepted_by="E9", semantic_lines=[f"{len(res._e9)} marketplace-clone file(s) updated and "
-                                                        "accepted as a clean clone of the recorded remote (E9)"],
-                      extra={"count": len(res._e9)})
-            n += 1
     return n
 
 
@@ -2695,7 +2577,7 @@ def window_anchor(index: dict[str, Path], days: int, now: float) -> dict:
 
 
 def cumulative_diff(old_files: dict, old_fps: dict, new_files: dict, new_fps: dict, tier: str = "all",
-                    vendor: list[str] | None = None) -> list[dict]:
+                    vendor: "Rules | list | None" = None) -> list[dict]:
     """Now vs then, as if nothing had been accepted in between. Same classifier as a live check,
     but there is no file text here, so the signature scan is not part of it."""
     out = []
@@ -2705,8 +2587,7 @@ def cumulative_diff(old_files: dict, old_fps: dict, new_files: dict, new_fps: di
             continue
         kind = "added" if o is None else "removed" if w is None else "changed"
         risk, lines = classify_item(kind, k, [], old_fps.get(k), new_fps.get(k), None)
-        risk, lines, _c = refine_risk(kind, k, [], risk, lines, o or "-", w or "-",
-                                      vendor if vendor is not None else DEFAULT_VENDOR_SYNC_PATHS)
+        risk, lines, _c = refine_risk(kind, k, [], risk, lines, o or "-", w or "-", vendor)
         out.append({"key": k, "kind": kind, "risk": risk, "lines": lines, "group": group_of(k)})
     out.sort(key=lambda d: (-RISK_RANK[d["risk"]], d["key"]))
     return out
@@ -2764,8 +2645,7 @@ def accepted_by_of(ev: dict, idx: dict) -> str | None:
 
 
 ACCEPT_WORDS = {"R-settle": "accepted automatically after the quiet cool-off (R-settle)",
-                "E8": "accepted automatically: official marketplace update (E8)",
-                "E9": "accepted automatically: clean git clone of the recorded marketplace remote (E9)",
+                "E8": "accepted automatically: official marketplace update (E8, before 0.4.3)",
                 "sign": "accepted when you signed a new baseline", None: "not accepted yet"}
 
 
@@ -2805,7 +2685,7 @@ def anchors_for(events: list[dict], index: dict[str, Path], now: float, signed: 
 
 def slow_drift(events: list[dict], now: float, cur: tuple[dict, dict] | None, anchors: list[dict],
                tier: str = "all", creep_n: int = DEFAULT_CREEP_N, skip_keys: set | frozenset = frozenset(),
-               vendor: list[str] | None = None) -> list[dict]:
+               vendor: "Rules | list | None" = None) -> list[dict]:
     """Deterministic. Four ways a series of individually acceptable steps adds up to something that
     would have been refused as one step. Reads only the trail and snapshots; nothing is accepted here."""
     out: list[dict] = []
@@ -2927,7 +2807,7 @@ def current_state(res: "Result", store: Store, user: Path) -> tuple[dict, dict] 
 
 def make_views(events: list[dict], now: float, cur: tuple[dict, dict] | None, index: dict[str, Path],
                signed: dict | None, tier: str, cfg: dict, skip_keys: set, as_of: str | None = None,
-               vendor: list[str] | None = None) -> dict:
+               vendor: "Rules | list | None" = None) -> dict:
     views: dict = {"as_of": as_of, "since_signed": None, "windows": [], "slow": [], "have_state": cur is not None}
     if cur is None:
         return views
@@ -3063,7 +2943,7 @@ def cmd_diff(args) -> int:
             print(f"cannot compare with {since} days ago: {a['label']}")
             return EXIT_USAGE
         old, ofps, label = a["snap"].get("files", {}), a["snap"].get("fingerprints", {}), a["label"]
-    diffs = cumulative_diff(old, ofps, new, fps, args.tier, ctx.vendor_keys())
+    diffs = cumulative_diff(old, ofps, new, fps, args.tier, ctx.rules(manifest.get("marketplaces", {})))
     print(f"Changes between {label} and now (every accepted step counted, nothing hidden):")
     for ln in describe_diff(diffs):
         print(ln)
@@ -3131,7 +3011,7 @@ def as_of_view(store: Store, user: Path, cfg: dict, tier: str, day: str):
                   "files": s0.get("files", {}), "fps": s0.get("fingerprints", {}), "seq": s0.get("seq")}
     skip = {i["key"] for i in res.items if item_rank(i) >= 2}
     views = make_views(events, end - 1, (files, fps), index, signed, tier, cfg, skip, as_of=day,
-                       vendor=_path_list(store.config(), "vendor_sync_paths", DEFAULT_VENDOR_SYNC_PATHS))
+                       vendor=res._rules)
     sign_ts = max((e["ts"] for e in idx["signs"]), default=0)
     accepted = {e["key"]: {"rule": "R-settle", "ts": local_day(e["ts"])} for e in events
                 if e["kind"] == "settled" and e["ts"] > sign_ts}
@@ -3172,9 +3052,10 @@ def plan_alerts(res: Result, state: dict, now: float) -> tuple[list[dict], dict]
             out.append({"level": "red" if s_ != "stale" else "grey",
                         "title": f"agent-integrity: {s_.upper()}",
                         "body": res.reason or res.stale_why or s_, "ids": [s_]})
-    # Claude Opus 5.5, 2026-11-22: the vendor-sync class is listed in every report but never pages.
+    # Claude Opus 5.5, 2026-11-22: the vendor-sync and marketplace-refresh classes are listed in every
+    # report but never page.
     review = {f"{i['key']}|{i.get('digest')}" for i in res.items
-              if item_rank(i) == 1 and i.get("class") != VENDOR_CLASS}
+              if item_rank(i) == 1 and i.get("class") not in QUIET_CLASSES}
     rv = state.get("review", {}) if isinstance(state.get("review"), dict) else {}
     rv_ids = set(rv.get("ids", [])) & review
     rv_day = rv.get("day", "")
@@ -3406,9 +3287,6 @@ def render_html(res: Result, hist: list[dict], accepted: dict, now: float, views
     # Auto-accepted
     p.append("<h2>Auto-accepted</h2>")
     settled = {k: v for k, v in accepted.items() if isinstance(v, dict) and v.get("rule") == "R-settle"}
-    p.append(f"<details><summary>E8 official-marketplace updates this run: {res.auto_accepted}</summary>"
-             "<p>Accepted on provenance from the signed manifest plus a clean signature scan. "
-             "Not listed per file.</p></details>")
     p.append(f"<details><summary>R-settle neutral changes accepted after the cool-off: {len(settled)}</summary><ul>"
              + "".join(f"<li><code>{e(k)}</code> at {e(str(v.get('ts', '')))}</li>" for k, v in sorted(settled.items())[:100])
              + "</ul></details>")
@@ -3653,7 +3531,7 @@ def key_is_watched(ctx: Ctx, key: str) -> bool:
                 return True
             if s["kind"] == "file" and fnmatch.fnmatchcase(path, pat):
                 return True
-    return False
+    return any(path == w or path.startswith(w + os.sep) for w in ctx.watch)
 
 
 def cmd_quarantine(args) -> int:

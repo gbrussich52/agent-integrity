@@ -10,23 +10,34 @@
     file. A link to a directory is walked too, its files keyed under the link path, and signature-scanned
     and fingerprinted through the link.
   - A retargeted link, or a file swapped for a link (or back), is `raising` at least, and is never
-    accepted on marketplace provenance or by settling.
+    accepted by settling or grouped into a quiet class.
   - Cycles stop on the chain of real directories being walked. Nesting is capped at 8 links and files are
     capped per link by `link_max_files` (store config, default 2000). A link over either cap is a finding
     on every run (`links` in JSON, `! LINK` in text, a SARIF error, one red alert), never a silent skip.
   - Pre-0.4.3 link records compare by the text of the link, so an upgrade alone reads as "changed", not
     as a retarget.
-- **Marketplace git clones (E9).** Prior code accepted marketplace drift only for official sources (E8),
-  so a refresh of any other marketplace clone showed as hundreds of changed and added files. Files under
-  `~/.claude/plugins/marketplaces/<name>/` are now accepted when the signed manifest recorded that
-  marketplace with today's source, the clone's single `origin` URL matches it (`owner/name`, https and
-  scp-style GitHub forms compare equal), `git status --porcelain --untracked-files=all` is empty, `HEAD`
-  is on a remote-tracking ref of `origin`, and the file has no high-severity signature hit. Otherwise
-  the drift is listed and a note gives the reason. Before git runs, `.git` must be a real directory
-  and `.git/config` must hold only allowlisted sections and keys (no fsmonitor, filters, includes or
-  other program-running settings). Git is called with an argument list, a 20 s timeout, a scrubbed
-  environment, no system or global config, `--no-optional-locks`, and `core.fsmonitor`/`core.hooksPath`
-  forced off.
+- **Marketplace refreshes are a class, and the official-marketplace auto-accept (E8) is gone.** Prior
+  code auto-accepted plugin drift when the signed manifest recorded the marketplace, its source string
+  was unchanged and started with an official prefix (`anthropics/`), and the changed files had no
+  high-severity hit. Those checks compare names and strings in local JSON; they never look at the
+  bytes, yet the report said "auto-accepted ... on provenance". Every other marketplace refresh showed
+  as hundreds of file lines.
+  - Drift under `~/.claude/plugins/cache/<name>/` or `~/.claude/plugins/marketplaces/<name>/`, where the
+    signed manifest recorded `<name>` with the source it still names today, is now the
+    `marketplace-refresh` class: one line per marketplace per run (changed, added and removed counts) at
+    `review-soon`, "contents unverified". It is never accepted, never settled and never alerted, and
+    the slow-drift rules see it at the same rank. One audit-trail event per marketplace, not per file.
+  - The official prefix grants nothing now, so `official_sources` has no effect.
+  - A high-severity signature hit there is still a threat and alerts. A retargeted link is still
+    raising. A marketplace missing from the signed manifest, or whose source changed, is outside the
+    class and classified as before (plugin files neutral, hook removals raising).
+  - JSON drops `auto_accepted`. Old trail events marked `E8` still render.
+- **`watch_paths` (store config, default `[]`).** Absolute directories or files outside the built-in
+  surfaces. Every file there is hashed and signature-scanned (no extension filter), links are followed
+  as in a hooks directory, and drift is `raising`. `baseline`, `check`, `diff` and `quarantine` honor
+  it.
+- **`baseline` honors config `projects`.** Prior code used `--project`, then the signed manifest, then
+  the working directory, so a baseline run elsewhere skipped a project that `check` watched.
 - **`ignore_paths` (store config, default `["~/.claude/plugins/.trash"]`).** Prior code skipped every
   directory named `.trash` anywhere, silently, so `hooks/.trash/x.sh` was unwatched. Now only the listed
   paths are skipped, every report and `baseline` print how many files the list skipped, and `[]` hashes
@@ -38,7 +49,9 @@
   also in the slow-drift rules. A high-severity signature hit there is still a threat and alerts; a
   retargeted link there is still raising.
 - The walk settings are read from the store's `config.json` only, never from the user-dir config.
-- Tests: `tests/test_sources.py` (16 tests; 15 fail on 0.4.2, the vendor threat test is a guard).
+- Tests: `tests/test_sources.py` (20 tests). The marketplace-refresh, `watch_paths` and `projects`
+  tests failed first; the signature-hit, unrecorded and source-changed tests are guards that already
+  held. `tests/test_drift.py` now asserts the refresh line in place of the E8 accept.
 
 ## 0.4.2 (unreleased)
 
